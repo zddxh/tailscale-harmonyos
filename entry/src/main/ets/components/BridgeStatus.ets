@@ -1,4 +1,5 @@
 import nativeBridge from 'libtailscale_ohos.so';
+import { PhysicalDNS } from '../services/PhysicalDNS';
 import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
@@ -150,6 +151,9 @@ export struct BridgeStatus {
   private lifecycleTimers: number[] = [];
   private lifecycleGeneration: number = 0;
   private refreshInFlight: boolean = false;
+  private physicalDNS: PhysicalDNS = new PhysicalDNS();
+  private backendStartPending?: Promise<void>;
+  private backendStartGeneration: number = -1;
   private peerDataSource: PeerDataSource = new PeerDataSource();
 
   private applyPeers(peers: PeerSummary[]): void {
@@ -191,6 +195,7 @@ export struct BridgeStatus {
 
   aboutToDisappear(): void {
     this.lifecycleGeneration++;
+    this.physicalDNS.stop();
     this.stopConnectionPolling();
     this.clearConnectionCompletionTimer();
     this.stopHealthPolling();
@@ -242,16 +247,48 @@ export struct BridgeStatus {
     }
   }
 
-  private startBackend(): void {
+  private startBackend(): Promise<void> {
+    const generation: number = this.lifecycleGeneration;
+    if (this.backendStartPending !== undefined) {
+      if (this.backendStartGeneration === generation) {
+        return this.backendStartPending;
+      }
+      return this.backendStartPending.then(() => {
+        if (generation === this.lifecycleGeneration) {
+          return this.startBackend();
+        }
+        return Promise.resolve();
+      });
+    }
+    this.backendStartGeneration = generation;
+    this.backendStartPending = this.startBackendWithDNS().finally(() => {
+      this.backendStartPending = undefined;
+    });
+    return this.backendStartPending;
+  }
+
+  private async startBackendWithDNS(): Promise<void> {
+    const generation: number = this.lifecycleGeneration;
     this.backendReady = false;
     this.devicesLoading = true;
+    this.backendStatus = 'Tailscale backend starting | capturing physical DNS';
     try {
+      await this.physicalDNS.start((status: string) => {
+        this.networkSettingStatus = status;
+      });
+      if (generation !== this.lifecycleGeneration) {
+        return;
+      }
+      // The excluded UI backend can authenticate using the physical network
+      // even if base DNS capture is unavailable. Keep its diagnostic visible.
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       this.backendStatus = nativeBridge.backendStart(`${context.filesDir}/tailscale`, this.deviceModel());
-    } catch (error) {
-      this.backendStatus = `Tailscale Backend Failed: ${JSON.stringify(error)}`;
-      this.backendReady = true;
-      this.devicesLoading = false;
+    } catch (_error) {
+      if (generation === this.lifecycleGeneration) {
+        this.backendStatus = 'FAILED | backend start | physical DNS or native startup unavailable';
+        this.backendReady = true;
+        this.devicesLoading = false;
+      }
     }
   }
 
@@ -480,6 +517,9 @@ export struct BridgeStatus {
   private async startVpnProbe(): Promise<void> {
     let backendStopRequested: boolean = false;
     try {
+      if (this.backendStartPending !== undefined) {
+        await this.backendStartPending;
+      }
       const retryExtensionFailure: boolean = this.extensionStartupFailed;
       const restoreBackend: boolean = retryExtensionFailure || this.vpnBackendNeedsRestore;
       if (retryExtensionFailure) {
@@ -489,7 +529,7 @@ export struct BridgeStatus {
       }
       if (restoreBackend) {
         this.vpnBackendNeedsRestore = false;
-        this.startBackend();
+        await this.startBackend();
       }
       let backendConfig: string = await nativeBridge.backendVpnConfigAsync();
       for (let attempt: number = 0; restoreBackend && backendConfig.startsWith('FAILED') &&
@@ -523,10 +563,11 @@ export struct BridgeStatus {
         this.magicDNSProbeStatus = magicDNSProbeUrl;
       }
       backendStopRequested = true;
+      this.physicalDNS.stop();
       this.backendStatus = await nativeBridge.backendStopAsync();
       if (this.backendStatus.startsWith('FAILED')) {
         this.failVpnConnection(this.backendStatus, '连接准备失败，请重试。');
-        this.startBackend();
+        await this.startBackend();
         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
         return;
       }
@@ -546,7 +587,7 @@ export struct BridgeStatus {
       if (backendStopRequested) {
         // A rejected VPN authorization leaves no extension to own the core.
         // Restore the UI backend so the next Connect attempt can obtain config.
-        this.startBackend();
+        await this.startBackend();
         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
       }
     }
@@ -2121,6 +2162,8 @@ export struct BridgeStatus {
       this.DiagnosticStatus('VPN Extension', this.vpnStatus, 'vpn-status')
       Divider().color($r('sys.color.comp_divider'))
       this.DiagnosticStatus('MagicDNS', this.magicDNSProbeStatus, 'magicdns-status')
+      Divider().color($r('sys.color.comp_divider'))
+      this.DiagnosticStatus('Network configuration', this.networkSettingStatus, 'physical-dns-status')
 
       this.StandardActionButton('Refresh status', 'backend-refresh', false, true, () => {
         this.verifyNativeBridge();

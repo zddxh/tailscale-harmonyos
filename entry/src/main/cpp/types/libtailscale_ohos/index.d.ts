@@ -19,6 +19,7 @@ export const tailscaleVersion: () => string;
 export const backendNetworkSettings: () => string;
 export const backendSetNetworkSetting: (key: string, enabled: boolean) => string;
 export const backendSetNetworkSettingAsync: (key: string, enabled: boolean) => Promise<string>;
+export const backendSetBaseDNSAsync: (configJson: string) => Promise<string>;
 export const backendSetExitNode: (id: string) => string;
 export const backendSetExitNodeAsync: (id: string) => Promise<string>;
 export const backendPeerProbe: () => string;

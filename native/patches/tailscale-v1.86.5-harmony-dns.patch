@@ -1,0 +1,154 @@
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -1274,6 +1274,7 @@
+ 			ss.InNetworkMap = true
+ 			if hi := nm.SelfNode.Hostinfo(); hi.Valid() {
+ 				ss.HostName = hi.Hostname()
++				ss.DeviceModel = hi.DeviceModel()
+ 			}
+ 			ss.DNSName = nm.Name
+ 			ss.UserID = nm.User()
+@@ -1335,6 +1336,7 @@
+ 			HostName:        p.Hostinfo().Hostname(),
+ 			DNSName:         p.Name(),
+ 			OS:              p.Hostinfo().OS(),
++			DeviceModel:     p.Hostinfo().DeviceModel(),
+ 			LastSeen:        p.LastSeen().Get(),
+ 			Online:          p.Online().Get(),
+ 			ShareeNode:      p.Hostinfo().ShareeNode(),
+--- a/ipn/ipnstate/ipnstate.go
++++ b/ipn/ipnstate/ipnstate.go
+@@ -228,9 +228,10 @@
+ 
+ 	// DNSName is the Peer's FQDN. It ends with a dot.
+ 	// It has the form "host.<MagicDNSSuffix>."
+-	DNSName string
+-	OS      string // HostInfo.OS
+-	UserID  tailcfg.UserID
++	DNSName     string
++	OS          string // HostInfo.OS
++	UserID      tailcfg.UserID
++	DeviceModel string `json:",omitempty"` // HostInfo.DeviceModel
+ 
+ 	// AltSharerUserID is the user who shared this node
+ 	// if it's different than UserID. Otherwise it's zero.
+@@ -475,6 +476,9 @@
+ 	}
+ 	if v := st.OS; v != "" {
+ 		e.OS = st.OS
++	}
++	if v := st.DeviceModel; v != "" {
++		e.DeviceModel = v
+ 	}
+ 	if v := st.SSH_HostKeys; v != nil {
+ 		e.SSH_HostKeys = v
+--- /dev/null
++++ b/tsnet/harmony_dns.go
+@@ -0,0 +1,30 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package tsnet
++
++import (
++	"errors"
++	"net"
++)
++
++// ErrDNSNotReady means startup has not created the DNS manager yet.
++var ErrDNSNotReady = errors.New("tsnet: DNS manager not ready")
++
++type dnsConfigRecompiler interface {
++	RecompileDNSConfig() error
++}
++
++// RecompileDNSConfig refreshes the physical DNS base without starting a server.
++// Close waits for an in-flight compilation before closing the DNS manager.
++func (s *Server) RecompileDNSConfig() error {
++	s.dnsOpMu.Lock()
++	defer s.dnsOpMu.Unlock()
++	if s.dnsClosing {
++		return net.ErrClosed
++	}
++	if s.dnsRecompiler == nil {
++		return ErrDNSNotReady
++	}
++	return s.dnsRecompiler.RecompileDNSConfig()
++}
+--- a/tsnet/tsnet.go
++++ b/tsnet/tsnet.go
+@@ -26,6 +26,8 @@
+ 	"sync"
+ 	"time"
+ 
++	"github.com/tailscale/wireguard-go/tun"
++
+ 	"tailscale.com/client/local"
+ 	"tailscale.com/client/tailscale"
+ 	"tailscale.com/control/controlclient"
+@@ -42,6 +44,7 @@
+ 	"tailscale.com/logpolicy"
+ 	"tailscale.com/logtail"
+ 	"tailscale.com/logtail/filch"
++	"tailscale.com/net/dns"
+ 	"tailscale.com/net/memnet"
+ 	"tailscale.com/net/netmon"
+ 	"tailscale.com/net/proxymux"
+@@ -64,6 +67,14 @@
+ //
+ // Its exported fields may be changed until the first method call.
+ type Server struct {
++	// Tun is the externally owned platform TUN. Set before Start.
++	Tun tun.Device
++	// DNSOSConfigurator supplies physical-network DNS without changing host settings.
++	// Set before Start. Nil retains the upstream no-op configurator.
++	DNSOSConfigurator dns.OSConfigurator
++	dnsOpMu           sync.Mutex
++	dnsRecompiler     dnsConfigRecompiler
++	dnsClosing        bool
+ 	// Dir specifies the name of the directory to use for
+ 	// state. If empty, a directory is selected automatically
+ 	// under os.UserConfigDir (https://golang.org/pkg/os/#UserConfigDir).
+@@ -381,6 +392,10 @@
+ //
+ // It must not be called before or concurrently with Start.
+ func (s *Server) Close() error {
++	s.dnsOpMu.Lock()
++	s.dnsClosing = true
++	s.dnsRecompiler = nil
++	s.dnsOpMu.Unlock()
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	if s.closed {
+@@ -571,6 +586,8 @@
+ 
+ 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
+ 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
++		Tun:           s.Tun,
++		DNS:           s.DNSOSConfigurator,
+ 		EventBus:      sys.Bus.Get(),
+ 		ListenPort:    s.Port,
+ 		NetMon:        s.netMon,
+@@ -584,6 +601,9 @@
+ 		return err
+ 	}
+ 	closePool.add(s.dialer)
++	s.dnsOpMu.Lock()
++	s.dnsRecompiler = sys.DNSManager.Get()
++	s.dnsOpMu.Unlock()
+ 	sys.Set(eng)
+ 	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
+ 
+@@ -594,8 +614,10 @@
+ 	}
+ 	sys.Tun.Get().Start()
+ 	sys.Set(ns)
+-	ns.ProcessLocalIPs = true
+-	ns.ProcessSubnets = true
++	// Platform TUN traffic must return to the host rather than be consumed by
++	// tsnet listeners. Service-IP DNS handling remains active in netstack.
++	ns.ProcessLocalIPs = s.Tun == nil
++	ns.ProcessSubnets = s.Tun == nil
+ 	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
+ 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
+ 	s.netstack = ns

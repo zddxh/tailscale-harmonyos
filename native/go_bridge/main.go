@@ -135,6 +135,14 @@ func TSBackendSetNetworkSetting(key *C.char, enabled C.int) *C.char {
 	return C.CString(harmonyBackend.setNetworkSetting(C.GoString(key), enabled != 0))
 }
 
+//export TSBackendSetBaseDNS
+func TSBackendSetBaseDNS(input *C.char) *C.char {
+	if input == nil {
+		return C.CString("FAILED | DNS base | missing input")
+	}
+	return C.CString(harmonyBackend.setBaseDNS(C.GoString(input)))
+}
+
 //export TSBackendSetExitNode
 func TSBackendSetExitNode(id *C.char) *C.char {
 	if id == nil {

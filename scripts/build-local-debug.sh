@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rebuild ArkTS/resources using verified v0.3.19 native libraries; no signing.
+# Rebuild ArkTS/resources using checksum-verified native libraries and local signing configuration.
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,7 +46,7 @@ main() {
   local native_dir="$project_root/entry/libs/arm64-v8a"
   for library in libtailscale_go.so libtailscale_ohos.so; do
     if [[ ! -f "$native_dir/$library" ]]; then
-      echo "Missing verified upstream native library: $native_dir/$library" >&2
+      echo "Missing verified native library: $native_dir/$library" >&2
       return 1
     fi
   done

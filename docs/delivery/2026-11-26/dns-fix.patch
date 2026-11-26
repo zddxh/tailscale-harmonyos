@@ -1,0 +1,1216 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,6 +5,7 @@
+ .tooling/
+ .hvigor-user/
+ .build-user/
++.sign/
+ build-logs/
+ .tools/
+ third_party/ohos-go/
+--- a/BUILD_LOCAL.md
++++ b/BUILD_LOCAL.md
+@@ -1,20 +1,43 @@
+ # 本机鸿蒙调试构建
+ 
+-此工程基于 Tailscale-OHOS `v0.3.19-release`。ArkTS 界面、VPN 扩展及资源从源码编译；Go 网络核心与 C++ NAPI 桥接使用该发布版 HAP 中提取的 arm64 预编译库，不属于 Go/C++ 源码重编。
++工程基于 Tailscale-OHOS `v0.3.19-release`。本次 DNS 修复同时从源码构建 ArkTS、C++ NAPI 桥接和 Tailscale v1.86.5 Go 核心。源码包包含打过补丁的 `third_party/tailscale`；来源、补丁及校验清单见 `native/SOURCE_LOCK.json`。
+ 
+ 本次工具链为 macOS DevEco Studio 26.0.1.290，捆绑 Hvigor 6.26.20、HarmonyOS API 26 Beta1 SDK。`compileSdkVersion` 必须为 `26.0.1`，以匹配本机 IDE；最低及目标 API 保留 23。API 23 的实际设备兼容性仍需另行验证；当前目标设备为 API 26。
+ 
++## 准备 Go 工具链
++
++必须使用 OpenHarmony SIG 的 Go 1.24.5 移植版。工具链源码固定于 `302a5306b6fad2f47196360b82561d1db1f954cf`，不随应用源码包分发：
++
+ ```sh
++git clone https://gitcode.com/openharmony-sig/ohos_golang_go.git third_party/ohos-go
++git -C third_party/ohos-go checkout 302a5306b6fad2f47196360b82561d1db1f954cf
++```
++
++在工具链 `src` 目录运行 `./make.bash`，将 `GOROOT_BOOTSTRAP` 指向已安装的 Go。本机使用 Homebrew Go 1.26.1 引导构建。设置 `GOCACHE` 和 `GOPATH` 到工程下的缓存目录，避免写入实际用户主目录。
++
++## 构建原生库和 HAP
++
++```sh
++# 已在其他位置构建工具链时指定 OHOS_GO_ROOT。
++OHOS_GO_ROOT=/absolute/path/to/ohos-go ./scripts/build-native-local.sh
+ ./scripts/build-local-debug.sh
+ ```
+ 
+ 脚本使用 DevEco 自带 Node、Java、Hvigor wrapper，支持用 `DEVECO_STUDIO_HOME` 指定其 `Contents` 目录。Hvigor 配置使用 IDE 内置插件，脚本校验版本为 6.26.20，避免下载另一份引擎。OHPM 配置、缓存与 Java 用户目录位于 `.build-user/`，Hvigor 缓存位于 `.hvigor-user/`。不安装全局工具，不修改 SDK。
+ 
+-构建前，`entry/libs/arm64-v8a/` 必须具有经完整上游 HAP 校验后提取的库及相对文件名格式的 `SHA256SUMS`；脚本每次重新校验这些库。缺少依赖或校验失败会停止构建。
++原生脚本校验工具链提交及 Tailscale 源文件清单，使用 SDK clang/CMake/Ninja 构建 Go 和 C++ 库；两阶段成功后才更新打包目录及 `SHA256SUMS`。`libc++_shared.so` 来自当前 SDK。Go 缓存位于 `.build-native/`；可通过 `OHOS_GOMODCACHE` 复用模块缓存。网络需要时可设置 `GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct`，依赖仍按 `go.sum` 校验。HAP 脚本在打包前重新校验全部原生库。
+ 
+-完整日志：`build-logs/local-debug.log`。未签名 HAP：`entry/build/default/outputs/default/entry-default-unsigned.hap`。此配置不含签名材料；安装到商用鸿蒙设备前还需有效的设备开发签名。编译成功不代表 VPN、登录、休眠或切网验证完成。
++源码包只含 `build-profile.example.json5`，不含本机开发签名、密码和证书。脚本在缺少 `build-profile.json5` 时复制示例配置；商用鸿蒙手机安装需要在 DevEco 中配置该设备的开发签名。本机已配置签名，但未将其打包。
+ 
++构建日志为 `build-logs/local-debug.log`，输出目录为 `entry/build/default/outputs/default/`。未签名包为 `entry-default-unsigned.hap`；配置有效签名时另有 `entry-default-signed.hap`。
+ 
+-## 2026-11-25 连接修复
++## DNS 回归验证
+ 
+-已更新启动心跳、Starting 阶段单次 peer 探测、失败清理、重试和取消超时。Go/C++ 库保持不变。源码包不含开发签名；本次 signed HAP 使用本机已有设备开发签名，覆盖安装保留登录。真机范围见 CONNECTION-REPORT.md。
++Go 主机测试可在 `native/go_bridge` 目录使用普通 Go 1.24 或兼容版本运行：
++
++```sh
++go test -race -run 'Test(ParseBaseDNS|HarmonyDNS|BaseDNSStaging)' -v .
++go vet ./...
++```
++
++完整测试中已知的 `TestClassifyPeerDevice/laptop` 将 ThinkPad 识别成 tablet，属于此次修复前的分类逻辑，尚未修复。DNS 配置测试不等于自建 tailnet DNS 服务器端到端可用；仍须用普通手机应用验证完整域名、IP、公共域名和断开重连。详细真机结果见交付报告。
+--- a/README.md
++++ b/README.md
+@@ -5,6 +5,26 @@
+ consumer application.
+ 
+ ## Current milestone
++
++### Local HarmonyOS 7 update (2026-11-26)
++
++The local development build fixes VPN startup/heartbeat recovery and supplies
++physical-network DNS to the Tailscale DNS compiler. MagicDNS hosts can now be
++installed in the resolver while retaining control-plane DNS policy. Physical
++resolver changes are monitored without changing device-wide DNS settings.
++The Go engine and C++ bridge are rebuilt from pinned sources; see
++[BUILD_LOCAL.md](BUILD_LOCAL.md) and `native/SOURCE_LOCK.json`.
++
++The DNS regression tests, race detector, vet, native build, ArkTS build, and
++signing passed. The signed update was installed on a HarmonyOS 7 API 26 phone,
++and the device owner reported successful use. The new version's browser
++MagicDNS/reconnect matrix was not independently completed before the owner
++resumed phone use; this report does not claim those checks passed. The previous
++local build had verified browser HTTP over Tailscale IPv4. Short-name search,
++custom tailnet DNS servers, and live network switching remain unverified.
++
++The historical upstream milestone below describes the original maintainer's
++test environment, not additional checks performed for this local build.
+ 
+ The project now provides a signed ArkTS application with this native stack:
+ 
+@@ -42,16 +62,10 @@
+ - exit-node choice restored across UI-to-Extension handoff and repeated signed
+   HAP replacement installs without requiring the user to select it again.
+ 
+-MagicDNS is treated as an optional feature. The client now has an
+-identity-redacted DNS/TUN probe, but the current test tailnet returns NXDOMAIN
+-for the same node name on both this HarmonyOS port and an Android Tailscale
+-client. Direct Tailscale-IP traffic remains fully functional, so this
+-cross-platform DNS-record result does not block the MVP.
+-
+-TODO(MagicDNS): repeat the end-to-end named-peer lookup on a tailnet with a
+-known-good MagicDNS record and promote the feature from optional only after a
+-positive DNS answer and successful peer traffic are both observed. Until then,
+-do not claim complete MagicDNS compatibility in the user interface.
++The original upstream release treated MagicDNS as optional after an NXDOMAIN
++result in its test environment. That historical result does not describe the
++local DNS fix above. Complete MagicDNS compatibility still requires broader
++real-device validation.
+ 
+ The bilingual Chinese/English UI uses the SDK 23 HDS floating bottom navigation
+ with immersive system material. Home owns connection state, the single
+--- a/entry/libs/arm64-v8a/SHA256SUMS
++++ b/entry/libs/arm64-v8a/SHA256SUMS
+@@ -1,3 +1,3 @@
+-e18522ffe1a721673e5b1fa0b05731b0214958a4dd697a227502085a9217079f  libc++_shared.so
+-53308484a537518250f63b93c62ad9314ca20e7df72c280f1985e52b84420817  libtailscale_go.so
+-af48df9bef7515f81c2e9b2ae02e69fe2b72250184e337ea9658cf98b55248b0  libtailscale_ohos.so
++f9e10eb9b8b560bd82d72a46882a2810ae2bd9d884e39d6db248f343d23649f6  libc++_shared.so
++5be1e61f051d33eef045de078b2c73af1ae301ee668b1a7a2553af5efc1fe3e7  libtailscale_go.so
++e905e834716fc484a782f10baeece2e320b08e359e27e72607e886235fafc8f2  libtailscale_ohos.so
+--- a/entry/src/main/cpp/CMakeLists.txt
++++ b/entry/src/main/cpp/CMakeLists.txt
+@@ -4,11 +4,11 @@
+ set(NATIVERENDER_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ include_directories(${NATIVERENDER_ROOT_PATH})
+-include_directories(${NATIVERENDER_ROOT_PATH}/../../../../native/go_bridge/dist/arm64-v8a)
++include_directories(${NATIVERENDER_ROOT_PATH}/../../../../native/go_bridge/dist/${OHOS_ARCH})
+ 
+ add_library(tailscale_go SHARED IMPORTED)
+ set_target_properties(tailscale_go PROPERTIES
+-    IMPORTED_LOCATION ${NATIVERENDER_ROOT_PATH}/../../../libs/${OHOS_ARCH}/libtailscale_go.so)
++    IMPORTED_LOCATION ${NATIVERENDER_ROOT_PATH}/../../../../native/go_bridge/dist/${OHOS_ARCH}/libtailscale_go.so)
+ 
+ add_library(tailscale_ohos SHARED napi_init.cpp)
+ 
+--- a/entry/src/main/cpp/napi_init.cpp
++++ b/entry/src/main/cpp/napi_init.cpp
+@@ -18,7 +18,8 @@
+ 
+ enum class AsyncInputOperation {
+     SetExitNode,
+-    SetNetworkSetting
++    SetNetworkSetting,
++    SetBaseDNS
+ };
+ 
+ struct AsyncInputWork {
+@@ -91,9 +92,18 @@
+ {
+     (void)env;
+     auto* work = static_cast<AsyncInputWork*>(data);
+-    char* message = work->operation == AsyncInputOperation::SetExitNode ?
+-        TSBackendSetExitNode(const_cast<char*>(work->input.c_str())) :
+-        TSBackendSetNetworkSetting(const_cast<char*>(work->input.c_str()), work->enabled ? 1 : 0);
++    char* message = nullptr;
++    switch (work->operation) {
++        case AsyncInputOperation::SetExitNode:
++            message = TSBackendSetExitNode(const_cast<char*>(work->input.c_str()));
++            break;
++        case AsyncInputOperation::SetNetworkSetting:
++            message = TSBackendSetNetworkSetting(const_cast<char*>(work->input.c_str()), work->enabled ? 1 : 0);
++            break;
++        case AsyncInputOperation::SetBaseDNS:
++            message = TSBackendSetBaseDNS(const_cast<char*>(work->input.c_str()));
++            break;
++    }
+     if (message == nullptr) {
+         work->succeeded = false;
+         return;
+@@ -165,6 +175,30 @@
+     }
+     return CreateAsyncInputPromise(
+         env, AsyncInputOperation::SetExitNode, selection.data(), false, "TailscaleBackendSetExitNode");
++}
++
++napi_value BackendSetBaseDNSAsync(napi_env env, napi_callback_info info)
++{
++    size_t argc = 1;
++    napi_value args[1] = {nullptr};
++    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc != 1) {
++        napi_throw_type_error(env, nullptr, "backendSetBaseDNSAsync requires one DNS configuration");
++        return nullptr;
++    }
++    size_t length = 0;
++    if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &length) != napi_ok ||
++        length == 0 || length > 16384) {
++        napi_throw_type_error(env, nullptr, "DNS configuration must be a nonempty string of at most 16 KiB");
++        return nullptr;
++    }
++    std::vector<char> input(length + 1, '\0');
++    if (napi_get_value_string_utf8(env, args[0], input.data(), input.size(), &length) != napi_ok ||
++        std::string(input.data(), length).find('\0') != std::string::npos) {
++        napi_throw_type_error(env, nullptr, "Invalid DNS configuration string");
++        return nullptr;
++    }
++    return CreateAsyncInputPromise(
++        env, AsyncInputOperation::SetBaseDNS, std::string(input.data(), length), false, "TailscaleBackendSetBaseDNS");
+ }
+ 
+ napi_value BackendSetNetworkSettingAsync(napi_env env, napi_callback_info info)
+@@ -756,6 +790,8 @@
+         {"backendSetNetworkSetting", nullptr, BackendSetNetworkSetting, nullptr, nullptr, nullptr, napi_default, nullptr},
+         {"backendSetNetworkSettingAsync", nullptr, BackendSetNetworkSettingAsync, nullptr, nullptr, nullptr,
+             napi_default, nullptr},
++        {"backendSetBaseDNSAsync", nullptr, BackendSetBaseDNSAsync, nullptr, nullptr, nullptr,
++            napi_default, nullptr},
+         {"backendSetExitNode", nullptr, BackendSetExitNode, nullptr, nullptr, nullptr, napi_default, nullptr},
+         {"backendSetExitNodeAsync", nullptr, BackendSetExitNodeAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
+         {"backendPeerProbe", nullptr, BackendPeerProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
+--- a/entry/src/main/cpp/types/libtailscale_ohos/index.d.ts
++++ b/entry/src/main/cpp/types/libtailscale_ohos/index.d.ts
+@@ -19,6 +19,7 @@
+ export const backendNetworkSettings: () => string;
+ export const backendSetNetworkSetting: (key: string, enabled: boolean) => string;
+ export const backendSetNetworkSettingAsync: (key: string, enabled: boolean) => Promise<string>;
++export const backendSetBaseDNSAsync: (configJson: string) => Promise<string>;
+ export const backendSetExitNode: (id: string) => string;
+ export const backendSetExitNodeAsync: (id: string) => Promise<string>;
+ export const backendPeerProbe: () => string;
+--- a/entry/src/main/ets/components/BridgeStatus.ets
++++ b/entry/src/main/ets/components/BridgeStatus.ets
+@@ -1,4 +1,5 @@
+ import nativeBridge from 'libtailscale_ohos.so';
++import { PhysicalDNS } from '../services/PhysicalDNS';
+ import { bundleManager, common, Want } from '@kit.AbilityKit';
+ import { vpnExtension } from '@kit.NetworkKit';
+ import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
+@@ -150,6 +151,9 @@
+   private lifecycleTimers: number[] = [];
+   private lifecycleGeneration: number = 0;
+   private refreshInFlight: boolean = false;
++  private physicalDNS: PhysicalDNS = new PhysicalDNS();
++  private backendStartPending?: Promise<void>;
++  private backendStartGeneration: number = -1;
+   private peerDataSource: PeerDataSource = new PeerDataSource();
+ 
+   private applyPeers(peers: PeerSummary[]): void {
+@@ -191,6 +195,7 @@
+ 
+   aboutToDisappear(): void {
+     this.lifecycleGeneration++;
++    this.physicalDNS.stop();
+     this.stopConnectionPolling();
+     this.clearConnectionCompletionTimer();
+     this.stopHealthPolling();
+@@ -242,16 +247,48 @@
+     }
+   }
+ 
+-  private startBackend(): void {
++  private startBackend(): Promise<void> {
++    const generation: number = this.lifecycleGeneration;
++    if (this.backendStartPending !== undefined) {
++      if (this.backendStartGeneration === generation) {
++        return this.backendStartPending;
++      }
++      return this.backendStartPending.then(() => {
++        if (generation === this.lifecycleGeneration) {
++          return this.startBackend();
++        }
++        return Promise.resolve();
++      });
++    }
++    this.backendStartGeneration = generation;
++    this.backendStartPending = this.startBackendWithDNS().finally(() => {
++      this.backendStartPending = undefined;
++    });
++    return this.backendStartPending;
++  }
++
++  private async startBackendWithDNS(): Promise<void> {
++    const generation: number = this.lifecycleGeneration;
+     this.backendReady = false;
+     this.devicesLoading = true;
++    this.backendStatus = 'Tailscale backend starting | capturing physical DNS';
+     try {
++      await this.physicalDNS.start((status: string) => {
++        this.networkSettingStatus = status;
++      });
++      if (generation !== this.lifecycleGeneration) {
++        return;
++      }
++      // The excluded UI backend can authenticate using the physical network
++      // even if base DNS capture is unavailable. Keep its diagnostic visible.
+       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+       this.backendStatus = nativeBridge.backendStart(`${context.filesDir}/tailscale`, this.deviceModel());
+-    } catch (error) {
+-      this.backendStatus = `Tailscale Backend Failed: ${JSON.stringify(error)}`;
+-      this.backendReady = true;
+-      this.devicesLoading = false;
++    } catch (_error) {
++      if (generation === this.lifecycleGeneration) {
++        this.backendStatus = 'FAILED | backend start | physical DNS or native startup unavailable';
++        this.backendReady = true;
++        this.devicesLoading = false;
++      }
+     }
+   }
+ 
+@@ -480,6 +517,9 @@
+   private async startVpnProbe(): Promise<void> {
+     let backendStopRequested: boolean = false;
+     try {
++      if (this.backendStartPending !== undefined) {
++        await this.backendStartPending;
++      }
+       const retryExtensionFailure: boolean = this.extensionStartupFailed;
+       const restoreBackend: boolean = retryExtensionFailure || this.vpnBackendNeedsRestore;
+       if (retryExtensionFailure) {
+@@ -489,7 +529,7 @@
+       }
+       if (restoreBackend) {
+         this.vpnBackendNeedsRestore = false;
+-        this.startBackend();
++        await this.startBackend();
+       }
+       let backendConfig: string = await nativeBridge.backendVpnConfigAsync();
+       for (let attempt: number = 0; restoreBackend && backendConfig.startsWith('FAILED') &&
+@@ -523,10 +563,11 @@
+         this.magicDNSProbeStatus = magicDNSProbeUrl;
+       }
+       backendStopRequested = true;
++      this.physicalDNS.stop();
+       this.backendStatus = await nativeBridge.backendStopAsync();
+       if (this.backendStatus.startsWith('FAILED')) {
+         this.failVpnConnection(this.backendStatus, '连接准备失败，请重试。');
+-        this.startBackend();
++        await this.startBackend();
+         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
+         return;
+       }
+@@ -546,7 +587,7 @@
+       if (backendStopRequested) {
+         // A rejected VPN authorization leaves no extension to own the core.
+         // Restore the UI backend so the next Connect attempt can obtain config.
+-        this.startBackend();
++        await this.startBackend();
+         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
+       }
+     }
+@@ -2121,6 +2162,8 @@
+       this.DiagnosticStatus('VPN Extension', this.vpnStatus, 'vpn-status')
+       Divider().color($r('sys.color.comp_divider'))
+       this.DiagnosticStatus('MagicDNS', this.magicDNSProbeStatus, 'magicdns-status')
++      Divider().color($r('sys.color.comp_divider'))
++      this.DiagnosticStatus('Network configuration', this.networkSettingStatus, 'physical-dns-status')
+ 
+       this.StandardActionButton('Refresh status', 'backend-refresh', false, true, () => {
+         this.verifyNativeBridge();
+--- a/entry/src/main/ets/services/PhysicalDNS.ets
++++ b/entry/src/main/ets/services/PhysicalDNS.ets
+@@ -0,0 +1,115 @@
++import { connection } from '@kit.NetworkKit';
++import { BusinessError } from '@kit.BasicServicesKit';
++import nativeBridge from 'libtailscale_ohos.so';
++
++interface BaseDNSConfig {
++  nameservers: string[];
++}
++
++// Each backend process owns a monitor. Resolver addresses stay in memory and
++// are never included in status messages or logs.
++export class PhysicalDNS {
++  private timer: number = -1;
++  private generation: number = 0;
++  private active: boolean = false;
++  private pending?: Promise<string>;
++  private appliedConfig: string = '';
++  private appliedNetId: number = -1;
++  private onStatus?: (status: string) => void;
++
++  async start(onStatus: (status: string) => void): Promise<string> {
++    this.active = true;
++    this.onStatus = onStatus;
++    const generation: number = this.generation;
++    // A previous lifecycle may still be completing a read/native call. Drain
++    // it before capturing again, without allowing overlapping native updates.
++    if (this.pending !== undefined) {
++      await this.pending;
++    }
++    if (!this.isCurrent(generation)) {
++      return 'FAILED | physical DNS | cancelled';
++    }
++    const status: string = await this.refresh();
++    if (this.isCurrent(generation) && this.timer < 0) {
++      this.timer = setInterval(() => { this.refresh(); }, 5000);
++    }
++    return status;
++  }
++
++  stop(): void {
++    this.active = false;
++    this.generation++;
++    this.onStatus = undefined;
++    this.appliedConfig = '';
++    this.appliedNetId = -1;
++    if (this.timer >= 0) {
++      clearInterval(this.timer);
++      this.timer = -1;
++    }
++  }
++
++  private refresh(): Promise<string> {
++    if (this.pending !== undefined) {
++      return this.pending;
++    }
++    const generation: number = this.generation;
++    this.pending = this.captureAndApply(generation).then((status: string) => {
++      if (this.isCurrent(generation) && this.onStatus !== undefined) {
++        this.onStatus(status);
++      }
++      return status;
++    }).finally(() => { this.pending = undefined; });
++    return this.pending;
++  }
++
++  private isCurrent(generation: number): boolean {
++    return this.active && generation === this.generation;
++  }
++
++  private async captureAndApply(generation: number): Promise<string> {
++    try {
++      const before: connection.NetHandle = await connection.getDefaultNet();
++      const caps: connection.NetCapabilities = await connection.getNetCapabilities(before);
++      if (before.netId <= 0 || caps.bearerTypes.includes(connection.NetBearType.BEARER_VPN)) {
++        return 'FAILED | physical DNS | no physical default network';
++      }
++      const properties: connection.ConnectionProperties = await connection.getConnectionProperties(before);
++      const after: connection.NetHandle = await connection.getDefaultNet();
++      if (before.netId !== after.netId) {
++        return 'FAILED | physical DNS | network changed during capture';
++      }
++      const nameservers: string[] = [];
++      for (const server of properties.dnses) {
++        const address: string = server.address.trim();
++        if (address.length > 0 && !nameservers.includes(address)) {
++          nameservers.push(address);
++        }
++      }
++      if (nameservers.length === 0 || nameservers.length > 64) {
++        return 'FAILED | physical DNS | resolver list unavailable';
++      }
++      if (!this.isCurrent(generation)) {
++        return 'FAILED | physical DNS | cancelled';
++      }
++      const config: BaseDNSConfig = { nameservers: nameservers };
++      const payload: string = JSON.stringify(config);
++      if (payload === this.appliedConfig && before.netId === this.appliedNetId) {
++        return 'OK | physical DNS | current';
++      }
++      const result: string = await nativeBridge.backendSetBaseDNSAsync(payload);
++      if (!this.isCurrent(generation)) {
++        return 'FAILED | physical DNS | cancelled';
++      }
++      if (!result.startsWith('OK')) {
++        // Native errors are a fixed, identity-redacted contract.
++        return result.startsWith('FAILED') ? result : 'FAILED | physical DNS | native update rejected';
++      }
++      this.appliedConfig = payload;
++      this.appliedNetId = before.netId;
++      return 'OK | physical DNS | captured';
++    } catch (error) {
++      const businessError = error as BusinessError;
++      return `FAILED | physical DNS | capture or update unavailable | code=${businessError.code ?? -1}`;
++    }
++  }
++}
+--- a/entry/src/main/ets/vpnextensionability/TailscaleVpnExtensionAbility.ets
++++ b/entry/src/main/ets/vpnextensionability/TailscaleVpnExtensionAbility.ets
+@@ -4,6 +4,7 @@
+ import { hilog } from '@kit.PerformanceAnalysisKit';
+ import { fileIo } from '@kit.CoreFileKit';
+ import nativeBridge from 'libtailscale_ohos.so';
++import { PhysicalDNS } from '../services/PhysicalDNS';
+ 
+ const DOMAIN = 0x0000;
+ const TAG = 'TailscaleVpn';
+@@ -20,6 +21,8 @@
+   private statusUpdateInFlight: boolean = false;
+   private destroyed: boolean = false;
+   private latestStatus: string = '';
++  private physicalDNS: PhysicalDNS = new PhysicalDNS();
++  private physicalDNSStatus: string = 'Physical DNS pending';
+ 
+   onCreate(want: Want): void {
+     this.writeStatus('VPN extension lifecycle entered');
+@@ -115,6 +118,10 @@
+       }
+     }
+     const useTailscaleDNS: boolean = configParts.length >= 4 && configParts[3] === 'true';
++    if (useTailscaleDNS && !this.physicalDNSStatus.startsWith('OK')) {
++      this.failStartup(this.physicalDNSStatus);
++      return;
++    }
+     const config: vpnExtension.VpnConfig = {
+       addresses: addresses,
+       routes: routes,
+@@ -177,6 +184,12 @@
+   }
+ 
+   private async restoreBackendVpnConfig(): Promise<string> {
++    await this.physicalDNS.start((status: string) => {
++      this.physicalDNSStatus = status;
++    });
++    if (this.destroyed) {
++      return 'FAILED | VPN startup | cancelled';
++    }
+     const stateDir: string = `${this.context.filesDir}/tailscale`;
+     const startStatus: string = nativeBridge.backendStart(stateDir, this.deviceModel());
+     if (startStatus.startsWith('FAILED')) {
+@@ -289,6 +302,7 @@
+       return;
+     }
+     this.stopStatusUpdates();
++    this.physicalDNS.stop();
+     this.writeStatus(status);
+     this.cleanupBackend();
+     const connection = this.vpnConnection;
+@@ -349,7 +363,7 @@
+     }
+     this.latestStatus = status;
+     this.writeTextFile(`${this.context.filesDir}/vpn-probe-status.txt`,
+-      `${status} | heartbeatMs=${Date.now()}`);
++      `${status} | physicalDNS=${this.physicalDNSStatus} | heartbeatMs=${Date.now()}`);
+   }
+ 
+   private writeTextFile(path: string, content: string): void {
+@@ -373,6 +387,7 @@
+ 
+   onDestroy(): void {
+     this.stopStatusUpdates();
++    this.physicalDNS.stop();
+     this.writeStatus('VPN extension destroyed');
+     this.destroyed = true;
+     this.cleanupBackend();
+--- a/entry/src/main/module.json5
++++ b/entry/src/main/module.json5
+@@ -48,6 +48,9 @@
+     "requestPermissions": [
+       {
+         "name": "ohos.permission.INTERNET"
++      },
++      {
++        "name": "ohos.permission.GET_NETWORK_INFO"
+       }
+     ]
+   }
+--- a/native/SOURCE_LOCK.json
++++ b/native/SOURCE_LOCK.json
+@@ -0,0 +1,24 @@
++{
++  "application": {
++    "tag": "v0.3.19-release",
++    "commit": "fbd14c5207e746389e54ff9f8f8593c46942adac"
++  },
++  "tailscale": {
++    "repository": "https://github.com/tailscale/tailscale",
++    "version": "v1.86.5",
++    "commit": "db392aed39630023f969e1961fcbced785d09358",
++    "archiveSHA256": "d62e70935491f80a87419444c8cda21b95975c086f3562865163ab2db1580c08",
++    "patch": "patches/tailscale-v1.86.5-harmony-dns.patch",
++    "patchSHA256": "d5d4c4668f62b3a84b96353f40749a1f817747251d8d178b8270764c3b5ac443",
++    "manifest": "tailscale-v1.86.5-patched.sha256",
++    "manifestSHA256": "762c2257478a7a8d2af6d6866db2215ac6182853f505c0076176ac45512a378c"
++  },
++  "goToolchain": {
++    "repository": "https://gitcode.com/openharmony-sig/ohos_golang_go.git",
++    "commit": "302a5306b6fad2f47196360b82561d1db1f954cf",
++    "version": "go1.24.5"
++  },
++  "target": "openharmony/arm64",
++  "sdk": "DevEco Studio 26.0.1.290, HarmonyOS API 26 Beta1",
++  "runtimeLibrary": "SDK aarch64-linux-ohos/libc++_shared.so"
++}
+--- a/native/go_bridge/backend.go
++++ b/native/go_bridge/backend.go
+@@ -28,6 +28,9 @@
+ 
+ type backendController struct {
+ 	mu           sync.Mutex
++	dnsUpdateMu  sync.Mutex
++	dnsBase      []netip.Addr
++	dnsAdapter   *harmonyDNSConfigurator
+ 	server       *tsnet.Server
+ 	client       *local.Client
+ 	starting     bool
+@@ -107,6 +110,7 @@
+ 	cancelStart := b.cancelStart
+ 	b.generation++
+ 	b.server = nil
++	b.dnsAdapter = nil
+ 	b.client = nil
+ 	b.starting = false
+ 	b.startErr = ""
+@@ -179,12 +183,14 @@
+ 	b.generation++
+ 	generation := b.generation
+ 	startContext, cancelStart := context.WithCancel(context.Background())
++	dnsAdapter := newHarmonyDNSConfigurator(b.dnsBase)
+ 	server := &tsnet.Server{
+-		Dir:       stateDir,
+-		Hostname:  harmonyHostname(trimmedModel),
+-		Ephemeral: false,
+-		UserLogf:  b.userLogf,
+-		Logf:      b.backendLogf,
++		DNSOSConfigurator: dnsAdapter,
++		Dir:               stateDir,
++		Hostname:          harmonyHostname(trimmedModel),
++		Ephemeral:         false,
++		UserLogf:          b.userLogf,
++		Logf:              b.backendLogf,
+ 	}
+ 	// Assigning a nil *harmonyTunDevice directly to the tun.Device interface
+ 	// creates a non-nil interface containing a nil pointer. wireguard-go then
+@@ -194,6 +200,7 @@
+ 		server.Tun = device
+ 	}
+ 	b.server = server
++	b.dnsAdapter = dnsAdapter
+ 	b.starting = true
+ 	b.startErr = ""
+ 	b.phase = "netns-disabled"
+@@ -221,6 +228,7 @@
+ 	cancelStart := b.cancelStart
+ 	b.generation++
+ 	b.server = nil
++	b.dnsAdapter = nil
+ 	b.client = nil
+ 	b.starting = false
+ 	b.startErr = ""
+--- a/native/go_bridge/dns_config.go
++++ b/native/go_bridge/dns_config.go
+@@ -0,0 +1,148 @@
++package main
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net/netip"
++	"slices"
++	"strings"
++	"sync"
++
++	"tailscale.com/net/dns"
++	"tailscale.com/net/tsaddr"
++	"tailscale.com/tsnet"
++)
++
++type baseDNSInput struct {
++	Nameservers []string `json:"nameservers"`
++}
++
++func parseBaseDNS(text string) ([]netip.Addr, error) {
++	if len(text) == 0 || len(text) > 16384 {
++		return nil, errors.New("input capacity")
++	}
++	var input baseDNSInput
++	decoder := json.NewDecoder(strings.NewReader(text))
++	decoder.DisallowUnknownFields()
++	if decoder.Decode(&input) != nil {
++		return nil, errors.New("invalid input")
++	}
++	var trailing any
++	if decoder.Decode(&trailing) != io.EOF {
++		return nil, errors.New("invalid input")
++	}
++	if len(input.Nameservers) == 0 || len(input.Nameservers) > 64 {
++		return nil, errors.New("resolver capacity")
++	}
++	addresses := make([]netip.Addr, 0, len(input.Nameservers))
++	for _, value := range input.Nameservers {
++		address, err := netip.ParseAddr(value)
++		if err != nil {
++			return nil, errors.New("invalid resolver")
++		}
++		address = address.Unmap()
++		plain := address.WithZone("")
++		if plain.IsUnspecified() || plain.IsLoopback() || plain.IsMulticast() ||
++			(!plain.IsGlobalUnicast() && !plain.IsLinkLocalUnicast()) ||
++			(address.Zone() != "" && !plain.IsLinkLocalUnicast()) {
++			return nil, errors.New("invalid resolver")
++		}
++		if plain == tsaddr.TailscaleServiceIP() || plain == tsaddr.TailscaleServiceIPv6() {
++			return nil, errors.New("resolver loop")
++		}
++		if !slices.Contains(addresses, address) {
++			addresses = append(addresses, address)
++		}
++	}
++	return addresses, nil
++}
++
++// setBaseDNS accepts only platform-supplied physical resolvers. It never
++// substitutes a public resolver or changes the control-plane split-DNS policy.
++func (b *backendController) setBaseDNS(text string) string {
++	base, err := parseBaseDNS(text)
++	if err != nil {
++		return "FAILED | DNS base | " + err.Error()
++	}
++	b.dnsUpdateMu.Lock()
++	defer b.dnsUpdateMu.Unlock()
++	b.mu.Lock()
++	b.dnsBase = slices.Clone(base)
++	server, adapter, generation := b.server, b.dnsAdapter, b.generation
++	if adapter != nil {
++		adapter.replaceBase(base)
++	}
++	b.mu.Unlock()
++	if server == nil || adapter == nil {
++		return "OK | DNS base staged"
++	}
++	err = server.RecompileDNSConfig()
++	b.mu.Lock()
++	current := b.server == server && b.dnsAdapter == adapter && b.generation == generation
++	b.mu.Unlock()
++	if !current {
++		return "FAILED | DNS base | session changed"
++	}
++	if errors.Is(err, tsnet.ErrDNSNotReady) || errors.Is(err, dns.ErrNoDNSConfig) {
++		// A later netmap will compile using the staged physical DNS base.
++		return "OK | DNS base staged"
++	}
++	if err != nil {
++		return "FAILED | DNS base | compilation unavailable"
++	}
++	return "OK | DNS base updated"
++}
++
++// harmonyDNSConfigurator lets Tailscale compile its complete DNS policy while
++// HarmonyOS retains ownership of VPN DNS application. The physical DNS base is
++// independent of SetDNS output so Quad100 can never become its own upstream.
++type harmonyDNSConfigurator struct {
++	mu     sync.Mutex
++	base   []netip.Addr
++	closed bool
++}
++
++func newHarmonyDNSConfigurator(base []netip.Addr) *harmonyDNSConfigurator {
++	return &harmonyDNSConfigurator{base: slices.Clone(base)}
++}
++
++func (d *harmonyDNSConfigurator) replaceBase(base []netip.Addr) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if !d.closed {
++		d.base = slices.Clone(base)
++	}
++}
++
++func (d *harmonyDNSConfigurator) SupportsSplitDNS() bool { return false }
++
++func (d *harmonyDNSConfigurator) GetBaseConfig() (dns.OSConfig, error) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.closed {
++		return dns.OSConfig{}, errors.New("DNS configurator closed")
++	}
++	if len(d.base) == 0 {
++		return dns.OSConfig{}, dns.ErrGetBaseConfigNotSupported
++	}
++	return dns.OSConfig{Nameservers: slices.Clone(d.base)}, nil
++}
++
++func (d *harmonyDNSConfigurator) SetDNS(dns.OSConfig) error {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.closed {
++		return errors.New("DNS configurator closed")
++	}
++	// The ArkTS VPN extension applies the DNS server through VpnConnection.
++	return nil
++}
++
++func (d *harmonyDNSConfigurator) Close() error {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	d.closed = true
++	d.base = nil
++	return nil
++}
+--- a/native/go_bridge/dns_config_test.go
++++ b/native/go_bridge/dns_config_test.go
+@@ -0,0 +1,179 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	mdns "github.com/miekg/dns"
++	"tailscale.com/control/controlknobs"
++	"tailscale.com/health"
++	"tailscale.com/net/dns"
++	"tailscale.com/net/netmon"
++	"tailscale.com/net/tsdial"
++	"tailscale.com/types/dnstype"
++	"tailscale.com/util/dnsname"
++)
++
++func TestParseBaseDNS(t *testing.T) {
++	for _, input := range []string{
++		``, `{}`, `null`, `{"nameservers":[]}`, `{"nameservers":["bad.example"]}`,
++		`{"nameservers":["192.0.2.53"],"extra":true}`, `{"nameservers":["192.0.2.53"]} {}`,
++		`{"nameservers":["127.0.0.1"]}`, `{"nameservers":["::ffff:127.0.0.1"]}`,
++		`{"nameservers":["0.0.0.0"]}`, `{"nameservers":["::ffff:0.0.0.0"]}`,
++		`{"nameservers":["::"]}`, `{"nameservers":["::1"]}`,
++		`{"nameservers":["224.0.0.1"]}`, `{"nameservers":["ff02::1"]}`,
++		`{"nameservers":["255.255.255.255"]}`, `{"nameservers":["100.100.100.100"]}`,
++		`{"nameservers":["::ffff:100.100.100.100"]}`, `{"nameservers":["fd7a:115c:a1e0::53"]}`,
++		`{"nameservers":["fd7a:115c:a1e0::53%wlan0"]}`, `{"nameservers":["2001:db8::53%wlan0"]}`,
++		strings.Repeat(" ", 16385),
++	} {
++		if _, err := parseBaseDNS(input); err == nil {
++			t.Errorf("parseBaseDNS(%q) accepted invalid input", input)
++		}
++	}
++	got, err := parseBaseDNS(`{"nameservers":["192.0.2.53","::ffff:192.0.2.53","2001:db8::53","fe80::53%wlan0"]}`)
++	want := []netip.Addr{netip.MustParseAddr("192.0.2.53"), netip.MustParseAddr("2001:db8::53"), netip.MustParseAddr("fe80::53%wlan0")}
++	if err != nil || !reflect.DeepEqual(got, want) {
++		t.Fatalf("parseBaseDNS = %v, %v; want %v", got, err, want)
++	}
++}
++
++func newDNSManagerForTest(t *testing.T, oscfg dns.OSConfigurator) *dns.Manager {
++	t.Helper()
++	dialer := tsdial.NewDialer(netmon.NewStatic())
++	t.Cleanup(func() { dialer.Close() })
++	manager := dns.NewManager(t.Logf, oscfg, new(health.Tracker), dialer, nil, &controlknobs.Knobs{}, "openharmony")
++	t.Cleanup(func() { manager.Down() })
++	return manager
++}
++
++func magicDNSConfig() dns.Config {
++	return dns.Config{
++		Routes:        map[dnsname.FQDN][]*dnstype.Resolver{"tail-test.ts.net.": nil},
++		Hosts:         map[dnsname.FQDN][]netip.Addr{"laptop.tail-test.ts.net.": {netip.MustParseAddr("100.101.102.103")}},
++		SearchDomains: []dnsname.FQDN{"tail-test.ts.net."},
++	}
++}
++
++func assertMagicDNSAnswer(t *testing.T, manager *dns.Manager) {
++	t.Helper()
++	query := new(mdns.Msg)
++	query.SetQuestion("laptop.tail-test.ts.net.", mdns.TypeA)
++	wire, err := query.Pack()
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	response, err := manager.Query(ctx, wire, "udp", netip.MustParseAddrPort("100.101.102.104:2000"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var reply mdns.Msg
++	if err := reply.Unpack(response); err != nil {
++		t.Fatal(err)
++	}
++	if reply.Rcode != mdns.RcodeSuccess || len(reply.Answer) != 1 {
++		t.Fatalf("MagicDNS reply = %v", &reply)
++	}
++	answer, ok := reply.Answer[0].(*mdns.A)
++	if !ok || answer.A.String() != "100.101.102.103" {
++		t.Fatalf("MagicDNS answer = %v", reply.Answer)
++	}
++}
++
++func assertDNSRoute(t *testing.T, manager *dns.Manager, name, want string) {
++	t.Helper()
++	got := manager.Resolver().GetUpstreamResolvers(dnsname.FQDN(name))
++	if len(got) != 1 || got[0].Addr != want {
++		t.Fatalf("upstream for %s = %v; want %s", name, got, want)
++	}
++}
++
++// This reproduces the old nil-DNS tsnet configuration's compile failure, then
++// proves the physical-base adapter installs a functioning MagicDNS host table.
++func TestHarmonyDNSCompilesMagicDNS(t *testing.T) {
++	noop, err := dns.NewNoopManager()
++	if err != nil {
++		t.Fatal(err)
++	}
++	oldManager := newDNSManagerForTest(t, noop)
++	if err := oldManager.Set(magicDNSConfig()); !errors.Is(err, dns.ErrGetBaseConfigNotSupported) {
++		t.Fatalf("old DNS manager.Set = %v; want unsupported base configuration", err)
++	}
++	adapter := newHarmonyDNSConfigurator([]netip.Addr{netip.MustParseAddr("192.0.2.53")})
++	manager := newDNSManagerForTest(t, adapter)
++	if err := manager.Set(magicDNSConfig()); err != nil {
++		t.Fatal(err)
++	}
++	assertMagicDNSAnswer(t, manager)
++	assertDNSRoute(t, manager, "www.example.com.", "192.0.2.53")
++}
++
++func TestHarmonyDNSPreservesSplitDNSAndRefreshesPhysicalBase(t *testing.T) {
++	adapter := newHarmonyDNSConfigurator(nil)
++	manager := newDNSManagerForTest(t, adapter)
++	cfg := magicDNSConfig()
++	cfg.Routes["corp.example."] = []*dnstype.Resolver{{Addr: "100.102.103.53"}}
++	if err := manager.Set(cfg); !errors.Is(err, dns.ErrGetBaseConfigNotSupported) {
++		t.Fatalf("Set before capture = %v", err)
++	}
++	// Recovery must reuse the last attempted config; no new netmap is required.
++	for _, physicalDNS := range []string{"192.0.2.53", "198.51.100.53"} {
++		adapter.replaceBase([]netip.Addr{netip.MustParseAddr(physicalDNS)})
++		if err := manager.RecompileDNSConfig(); err != nil {
++			t.Fatal(err)
++		}
++		assertMagicDNSAnswer(t, manager)
++		assertDNSRoute(t, manager, "files.corp.example.", "100.102.103.53")
++		assertDNSRoute(t, manager, "www.example.com.", physicalDNS)
++	}
++	// A tailnet-admin default resolver retains precedence over physical DNS.
++	cfg.DefaultResolvers = []*dnstype.Resolver{{Addr: "203.0.113.53"}}
++	if err := manager.Set(cfg); err != nil {
++		t.Fatal(err)
++	}
++	assertMagicDNSAnswer(t, manager)
++	assertDNSRoute(t, manager, "files.corp.example.", "100.102.103.53")
++	assertDNSRoute(t, manager, "www.example.com.", "203.0.113.53")
++}
++
++func TestBaseDNSStagingAndAdapterIsolation(t *testing.T) {
++	var backend backendController
++	if got := backend.setBaseDNS(`{"nameservers":["192.0.2.53"]}`); got != "OK | DNS base staged" {
++		t.Fatal(got)
++	}
++	if backend.server != nil {
++		t.Fatal("DNS staging implicitly started backend")
++	}
++	backend.stop()
++	if len(backend.dnsBase) != 1 || backend.dnsBase[0].String() != "192.0.2.53" {
++		t.Fatal("backend stop lost physical DNS for TUN restart")
++	}
++	if got := backend.setBaseDNS(`{"nameservers":["private.invalid.example"]}`); got != "FAILED | DNS base | invalid resolver" {
++		t.Fatalf("failure was not redacted: %q", got)
++	}
++	adapter := newHarmonyDNSConfigurator(backend.dnsBase)
++	backend.dnsBase[0] = netip.MustParseAddr("198.51.100.53")
++	base, err := adapter.GetBaseConfig()
++	if err != nil || base.Nameservers[0].String() != "192.0.2.53" {
++		t.Fatalf("adapter aliased staged base: %v, %v", base, err)
++	}
++	base.Nameservers[0] = netip.MustParseAddr("203.0.113.53")
++	base, _ = adapter.GetBaseConfig()
++	if base.Nameservers[0].String() != "192.0.2.53" {
++		t.Fatal("returned base aliases adapter state")
++	}
++	if err := adapter.Close(); err != nil {
++		t.Fatal(err)
++	}
++	adapter.replaceBase(backend.dnsBase)
++	if _, err := adapter.GetBaseConfig(); err == nil {
++		t.Fatal("closed adapter revived")
++	}
++}
+--- a/native/go_bridge/main.go
++++ b/native/go_bridge/main.go
+@@ -135,6 +135,14 @@
+ 	return C.CString(harmonyBackend.setNetworkSetting(C.GoString(key), enabled != 0))
+ }
+ 
++//export TSBackendSetBaseDNS
++func TSBackendSetBaseDNS(input *C.char) *C.char {
++	if input == nil {
++		return C.CString("FAILED | DNS base | missing input")
++	}
++	return C.CString(harmonyBackend.setBaseDNS(C.GoString(input)))
++}
++
+ //export TSBackendSetExitNode
+ func TSBackendSetExitNode(id *C.char) *C.char {
+ 	if id == nil {
+--- a/native/patches/tailscale-v1.86.5-harmony-dns.patch
++++ b/native/patches/tailscale-v1.86.5-harmony-dns.patch
+@@ -0,0 +1,154 @@
++--- a/ipn/ipnlocal/local.go
+++++ b/ipn/ipnlocal/local.go
++@@ -1274,6 +1274,7 @@
++ 			ss.InNetworkMap = true
++ 			if hi := nm.SelfNode.Hostinfo(); hi.Valid() {
++ 				ss.HostName = hi.Hostname()
+++				ss.DeviceModel = hi.DeviceModel()
++ 			}
++ 			ss.DNSName = nm.Name
++ 			ss.UserID = nm.User()
++@@ -1335,6 +1336,7 @@
++ 			HostName:        p.Hostinfo().Hostname(),
++ 			DNSName:         p.Name(),
++ 			OS:              p.Hostinfo().OS(),
+++			DeviceModel:     p.Hostinfo().DeviceModel(),
++ 			LastSeen:        p.LastSeen().Get(),
++ 			Online:          p.Online().Get(),
++ 			ShareeNode:      p.Hostinfo().ShareeNode(),
++--- a/ipn/ipnstate/ipnstate.go
+++++ b/ipn/ipnstate/ipnstate.go
++@@ -228,9 +228,10 @@
++ 
++ 	// DNSName is the Peer's FQDN. It ends with a dot.
++ 	// It has the form "host.<MagicDNSSuffix>."
++-	DNSName string
++-	OS      string // HostInfo.OS
++-	UserID  tailcfg.UserID
+++	DNSName     string
+++	OS          string // HostInfo.OS
+++	UserID      tailcfg.UserID
+++	DeviceModel string `json:",omitempty"` // HostInfo.DeviceModel
++ 
++ 	// AltSharerUserID is the user who shared this node
++ 	// if it's different than UserID. Otherwise it's zero.
++@@ -475,6 +476,9 @@
++ 	}
++ 	if v := st.OS; v != "" {
++ 		e.OS = st.OS
+++	}
+++	if v := st.DeviceModel; v != "" {
+++		e.DeviceModel = v
++ 	}
++ 	if v := st.SSH_HostKeys; v != nil {
++ 		e.SSH_HostKeys = v
++--- /dev/null
+++++ b/tsnet/harmony_dns.go
++@@ -0,0 +1,30 @@
+++// Copyright (c) Tailscale Inc & contributors
+++// SPDX-License-Identifier: BSD-3-Clause
+++
+++package tsnet
+++
+++import (
+++	"errors"
+++	"net"
+++)
+++
+++// ErrDNSNotReady means startup has not created the DNS manager yet.
+++var ErrDNSNotReady = errors.New("tsnet: DNS manager not ready")
+++
+++type dnsConfigRecompiler interface {
+++	RecompileDNSConfig() error
+++}
+++
+++// RecompileDNSConfig refreshes the physical DNS base without starting a server.
+++// Close waits for an in-flight compilation before closing the DNS manager.
+++func (s *Server) RecompileDNSConfig() error {
+++	s.dnsOpMu.Lock()
+++	defer s.dnsOpMu.Unlock()
+++	if s.dnsClosing {
+++		return net.ErrClosed
+++	}
+++	if s.dnsRecompiler == nil {
+++		return ErrDNSNotReady
+++	}
+++	return s.dnsRecompiler.RecompileDNSConfig()
+++}
++--- a/tsnet/tsnet.go
+++++ b/tsnet/tsnet.go
++@@ -26,6 +26,8 @@
++ 	"sync"
++ 	"time"
++ 
+++	"github.com/tailscale/wireguard-go/tun"
+++
++ 	"tailscale.com/client/local"
++ 	"tailscale.com/client/tailscale"
++ 	"tailscale.com/control/controlclient"
++@@ -42,6 +44,7 @@
++ 	"tailscale.com/logpolicy"
++ 	"tailscale.com/logtail"
++ 	"tailscale.com/logtail/filch"
+++	"tailscale.com/net/dns"
++ 	"tailscale.com/net/memnet"
++ 	"tailscale.com/net/netmon"
++ 	"tailscale.com/net/proxymux"
++@@ -64,6 +67,14 @@
++ //
++ // Its exported fields may be changed until the first method call.
++ type Server struct {
+++	// Tun is the externally owned platform TUN. Set before Start.
+++	Tun tun.Device
+++	// DNSOSConfigurator supplies physical-network DNS without changing host settings.
+++	// Set before Start. Nil retains the upstream no-op configurator.
+++	DNSOSConfigurator dns.OSConfigurator
+++	dnsOpMu           sync.Mutex
+++	dnsRecompiler     dnsConfigRecompiler
+++	dnsClosing        bool
++ 	// Dir specifies the name of the directory to use for
++ 	// state. If empty, a directory is selected automatically
++ 	// under os.UserConfigDir (https://golang.org/pkg/os/#UserConfigDir).
++@@ -381,6 +392,10 @@
++ //
++ // It must not be called before or concurrently with Start.
++ func (s *Server) Close() error {
+++	s.dnsOpMu.Lock()
+++	s.dnsClosing = true
+++	s.dnsRecompiler = nil
+++	s.dnsOpMu.Unlock()
++ 	s.mu.Lock()
++ 	defer s.mu.Unlock()
++ 	if s.closed {
++@@ -571,6 +586,8 @@
++ 
++ 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
++ 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
+++		Tun:           s.Tun,
+++		DNS:           s.DNSOSConfigurator,
++ 		EventBus:      sys.Bus.Get(),
++ 		ListenPort:    s.Port,
++ 		NetMon:        s.netMon,
++@@ -584,6 +601,9 @@
++ 		return err
++ 	}
++ 	closePool.add(s.dialer)
+++	s.dnsOpMu.Lock()
+++	s.dnsRecompiler = sys.DNSManager.Get()
+++	s.dnsOpMu.Unlock()
++ 	sys.Set(eng)
++ 	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
++ 
++@@ -594,8 +614,10 @@
++ 	}
++ 	sys.Tun.Get().Start()
++ 	sys.Set(ns)
++-	ns.ProcessLocalIPs = true
++-	ns.ProcessSubnets = true
+++	// Platform TUN traffic must return to the host rather than be consumed by
+++	// tsnet listeners. Service-IP DNS handling remains active in netstack.
+++	ns.ProcessLocalIPs = s.Tun == nil
+++	ns.ProcessSubnets = s.Tun == nil
++ 	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
++ 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
++ 	s.netstack = ns
+--- a/scripts/build-local-debug.sh
++++ b/scripts/build-local-debug.sh
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+-# Rebuild ArkTS/resources using verified v0.3.19 native libraries; no signing.
++# Rebuild ArkTS/resources using checksum-verified native libraries and local signing configuration.
+ set -euo pipefail
+ 
+ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+@@ -46,7 +46,7 @@
+   local native_dir="$project_root/entry/libs/arm64-v8a"
+   for library in libtailscale_go.so libtailscale_ohos.so; do
+     if [[ ! -f "$native_dir/$library" ]]; then
+-      echo "Missing verified upstream native library: $native_dir/$library" >&2
++      echo "Missing verified native library: $native_dir/$library" >&2
+       return 1
+     fi
+   done
+--- a/scripts/build-native-local.sh
++++ b/scripts/build-native-local.sh
+@@ -0,0 +1,57 @@
++#!/bin/bash
++# Rebuild the pinned Go engine and its matching NAPI bridge before packaging.
++set -euo pipefail
++
++project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++deveco_home="${DEVECO_STUDIO_HOME:-/Applications/DevEco-Studio.app/Contents}"
++native_sdk="$deveco_home/sdk/default/openharmony/native"
++go_root="${OHOS_GO_ROOT:-$project_root/third_party/ohos-go}"
++build_dir="$project_root/.build-native"
++dist_dir="$project_root/native/go_bridge/dist/arm64-v8a"
++lib_dir="$project_root/entry/libs/arm64-v8a"
++
++test -x "$go_root/bin/go"
++test -f "$project_root/third_party/tailscale/go.mod"
++test "$(git -C "$go_root" rev-parse HEAD)" = 302a5306b6fad2f47196360b82561d1db1f954cf
++test "$(head -n 1 "$go_root/VERSION")" = go1.24.5
++mkdir -p "$build_dir" "$dist_dir" "$lib_dir" "$project_root/build-logs"
++(
++  cd "$project_root/third_party/tailscale"
++  shasum -a 256 -c "$project_root/native/tailscale-v1.86.5-patched.sha256" > "$project_root/build-logs/vendor-checksums.log"
++)
++
++export GOROOT="$go_root"
++export PATH="$go_root/bin:$PATH"
++export GOOS=openharmony GOARCH=arm64 CGO_ENABLED=1
++export GOTOOLCHAIN=local GOENV=off GOWORK=off GOFLAGS= GOEXPERIMENT=
++export GOCACHE="$build_dir/go-cache" GOPATH="$build_dir/gopath"
++export GOMODCACHE="${OHOS_GOMODCACHE:-$build_dir/gomodcache}"
++export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
++# Go's CC parser only removes quotes at the start of an argument.
++export CC="\"$native_sdk/llvm/bin/clang\" --target=aarch64-linux-ohos \"--sysroot=$native_sdk/sysroot\" -D__MUSL__ -fstack-protector-strong"
++export CXX="\"$native_sdk/llvm/bin/clang++\" --target=aarch64-linux-ohos \"--sysroot=$native_sdk/sysroot\" -D__MUSL__ -fstack-protector-strong"
++
++(
++  cd "$project_root/native/go_bridge"
++  go build -p 2 -mod=readonly -buildmode=c-shared -trimpath -buildvcs=false \
++    -ldflags='-extldflags=-Wl,-soname,libtailscale_go.so,--build-id=sha1,-z,relro,-z,now,-z,noexecstack -X tailscale.com/version.longStamp=1.86.5 -X tailscale.com/version.shortStamp=1.86.5' \
++    -o "$dist_dir/libtailscale_go.so" .
++)
++
++cmake_bin="$native_sdk/build-tools/cmake/bin/cmake"
++"$cmake_bin" -S "$project_root/entry/src/main/cpp" -B "$build_dir/cpp" -G Ninja \
++  -DCMAKE_MAKE_PROGRAM="$native_sdk/build-tools/cmake/bin/ninja" \
++  -DCMAKE_TOOLCHAIN_FILE="$native_sdk/build/cmake/ohos.toolchain.cmake" \
++  -DOHOS_ARCH=arm64-v8a -DOHOS_STL=c++_shared -DCMAKE_BUILD_TYPE=Release -DCMAKE_SKIP_RPATH=TRUE
++"$cmake_bin" --build "$build_dir/cpp" --parallel 2
++
++# Publish only after both stages succeed; the checksum file is written last.
++cp "$dist_dir/libtailscale_go.so" "$lib_dir/libtailscale_go.so"
++cp "$build_dir/cpp/libtailscale_ohos.so" "$lib_dir/libtailscale_ohos.so"
++cp "$native_sdk/llvm/lib/aarch64-linux-ohos/libc++_shared.so" "$lib_dir/libc++_shared.so"
++(
++  cd "$lib_dir"
++  shasum -a 256 libc++_shared.so libtailscale_go.so libtailscale_ohos.so > SHA256SUMS.next
++  mv SHA256SUMS.next SHA256SUMS
++)
++echo "Native libraries rebuilt from source. Run scripts/build-local-debug.sh to assemble the HAP."

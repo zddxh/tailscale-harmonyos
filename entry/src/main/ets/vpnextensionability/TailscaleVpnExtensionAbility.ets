@@ -4,6 +4,7 @@ import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { fileIo } from '@kit.CoreFileKit';
 import nativeBridge from 'libtailscale_ohos.so';
+import { PhysicalDNS } from '../services/PhysicalDNS';
 
 const DOMAIN = 0x0000;
 const TAG = 'TailscaleVpn';
@@ -20,6 +21,8 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
   private statusUpdateInFlight: boolean = false;
   private destroyed: boolean = false;
   private latestStatus: string = '';
+  private physicalDNS: PhysicalDNS = new PhysicalDNS();
+  private physicalDNSStatus: string = 'Physical DNS pending';
 
   onCreate(want: Want): void {
     this.writeStatus('VPN extension lifecycle entered');
@@ -115,6 +118,10 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
       }
     }
     const useTailscaleDNS: boolean = configParts.length >= 4 && configParts[3] === 'true';
+    if (useTailscaleDNS && !this.physicalDNSStatus.startsWith('OK')) {
+      this.failStartup(this.physicalDNSStatus);
+      return;
+    }
     const config: vpnExtension.VpnConfig = {
       addresses: addresses,
       routes: routes,
@@ -177,6 +184,12 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
   }
 
   private async restoreBackendVpnConfig(): Promise<string> {
+    await this.physicalDNS.start((status: string) => {
+      this.physicalDNSStatus = status;
+    });
+    if (this.destroyed) {
+      return 'FAILED | VPN startup | cancelled';
+    }
     const stateDir: string = `${this.context.filesDir}/tailscale`;
     const startStatus: string = nativeBridge.backendStart(stateDir, this.deviceModel());
     if (startStatus.startsWith('FAILED')) {
@@ -289,6 +302,7 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
       return;
     }
     this.stopStatusUpdates();
+    this.physicalDNS.stop();
     this.writeStatus(status);
     this.cleanupBackend();
     const connection = this.vpnConnection;
@@ -349,7 +363,7 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
     }
     this.latestStatus = status;
     this.writeTextFile(`${this.context.filesDir}/vpn-probe-status.txt`,
-      `${status} | heartbeatMs=${Date.now()}`);
+      `${status} | physicalDNS=${this.physicalDNSStatus} | heartbeatMs=${Date.now()}`);
   }
 
   private writeTextFile(path: string, content: string): void {
@@ -373,6 +387,7 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
 
   onDestroy(): void {
     this.stopStatusUpdates();
+    this.physicalDNS.stop();
     this.writeStatus('VPN extension destroyed');
     this.destroyed = true;
     this.cleanupBackend();

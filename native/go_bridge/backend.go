@@ -28,6 +28,9 @@ import (
 
 type backendController struct {
 	mu           sync.Mutex
+	dnsUpdateMu  sync.Mutex
+	dnsBase      []netip.Addr
+	dnsAdapter   *harmonyDNSConfigurator
 	server       *tsnet.Server
 	client       *local.Client
 	starting     bool
@@ -107,6 +110,7 @@ func (b *backendController) stop() string {
 	cancelStart := b.cancelStart
 	b.generation++
 	b.server = nil
+	b.dnsAdapter = nil
 	b.client = nil
 	b.starting = false
 	b.startErr = ""
@@ -179,12 +183,14 @@ func (b *backendController) startWithDevice(stateDir, deviceModel string, device
 	b.generation++
 	generation := b.generation
 	startContext, cancelStart := context.WithCancel(context.Background())
+	dnsAdapter := newHarmonyDNSConfigurator(b.dnsBase)
 	server := &tsnet.Server{
-		Dir:       stateDir,
-		Hostname:  harmonyHostname(trimmedModel),
-		Ephemeral: false,
-		UserLogf:  b.userLogf,
-		Logf:      b.backendLogf,
+		DNSOSConfigurator: dnsAdapter,
+		Dir:               stateDir,
+		Hostname:          harmonyHostname(trimmedModel),
+		Ephemeral:         false,
+		UserLogf:          b.userLogf,
+		Logf:              b.backendLogf,
 	}
 	// Assigning a nil *harmonyTunDevice directly to the tun.Device interface
 	// creates a non-nil interface containing a nil pointer. wireguard-go then
@@ -194,6 +200,7 @@ func (b *backendController) startWithDevice(stateDir, deviceModel string, device
 		server.Tun = device
 	}
 	b.server = server
+	b.dnsAdapter = dnsAdapter
 	b.starting = true
 	b.startErr = ""
 	b.phase = "netns-disabled"
@@ -221,6 +228,7 @@ func (b *backendController) restartWithTun(stateDir, deviceModel string, fd int)
 	cancelStart := b.cancelStart
 	b.generation++
 	b.server = nil
+	b.dnsAdapter = nil
 	b.client = nil
 	b.starting = false
 	b.startErr = ""

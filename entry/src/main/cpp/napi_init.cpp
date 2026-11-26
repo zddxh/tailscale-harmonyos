@@ -18,7 +18,8 @@ struct AsyncStringWork {
 
 enum class AsyncInputOperation {
     SetExitNode,
-    SetNetworkSetting
+    SetNetworkSetting,
+    SetBaseDNS
 };
 
 struct AsyncInputWork {
@@ -91,9 +92,18 @@ void ExecuteAsyncInput(napi_env env, void* data)
 {
     (void)env;
     auto* work = static_cast<AsyncInputWork*>(data);
-    char* message = work->operation == AsyncInputOperation::SetExitNode ?
-        TSBackendSetExitNode(const_cast<char*>(work->input.c_str())) :
-        TSBackendSetNetworkSetting(const_cast<char*>(work->input.c_str()), work->enabled ? 1 : 0);
+    char* message = nullptr;
+    switch (work->operation) {
+        case AsyncInputOperation::SetExitNode:
+            message = TSBackendSetExitNode(const_cast<char*>(work->input.c_str()));
+            break;
+        case AsyncInputOperation::SetNetworkSetting:
+            message = TSBackendSetNetworkSetting(const_cast<char*>(work->input.c_str()), work->enabled ? 1 : 0);
+            break;
+        case AsyncInputOperation::SetBaseDNS:
+            message = TSBackendSetBaseDNS(const_cast<char*>(work->input.c_str()));
+            break;
+    }
     if (message == nullptr) {
         work->succeeded = false;
         return;
@@ -165,6 +175,30 @@ napi_value BackendSetExitNodeAsync(napi_env env, napi_callback_info info)
     }
     return CreateAsyncInputPromise(
         env, AsyncInputOperation::SetExitNode, selection.data(), false, "TailscaleBackendSetExitNode");
+}
+
+napi_value BackendSetBaseDNSAsync(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc != 1) {
+        napi_throw_type_error(env, nullptr, "backendSetBaseDNSAsync requires one DNS configuration");
+        return nullptr;
+    }
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &length) != napi_ok ||
+        length == 0 || length > 16384) {
+        napi_throw_type_error(env, nullptr, "DNS configuration must be a nonempty string of at most 16 KiB");
+        return nullptr;
+    }
+    std::vector<char> input(length + 1, '\0');
+    if (napi_get_value_string_utf8(env, args[0], input.data(), input.size(), &length) != napi_ok ||
+        std::string(input.data(), length).find('\0') != std::string::npos) {
+        napi_throw_type_error(env, nullptr, "Invalid DNS configuration string");
+        return nullptr;
+    }
+    return CreateAsyncInputPromise(
+        env, AsyncInputOperation::SetBaseDNS, std::string(input.data(), length), false, "TailscaleBackendSetBaseDNS");
 }
 
 napi_value BackendSetNetworkSettingAsync(napi_env env, napi_callback_info info)
@@ -755,6 +789,8 @@ static napi_value Init(napi_env env, napi_value exports)
         {"backendNetworkSettings", nullptr, BackendNetworkSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"backendSetNetworkSetting", nullptr, BackendSetNetworkSetting, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"backendSetNetworkSettingAsync", nullptr, BackendSetNetworkSettingAsync, nullptr, nullptr, nullptr,
+            napi_default, nullptr},
+        {"backendSetBaseDNSAsync", nullptr, BackendSetBaseDNSAsync, nullptr, nullptr, nullptr,
             napi_default, nullptr},
         {"backendSetExitNode", nullptr, BackendSetExitNode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"backendSetExitNodeAsync", nullptr, BackendSetExitNodeAsync, nullptr, nullptr, nullptr, napi_default, nullptr},

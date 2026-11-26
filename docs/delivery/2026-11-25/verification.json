@@ -1,0 +1,68 @@
+{
+  "date": "2026-11-25",
+  "timezone": "Asia/Shanghai",
+  "device": {
+    "model": "CMS-AL20",
+    "os": "7.0.0.115",
+    "api": 26
+  },
+  "bundleName": "com.example.tailscaleharmony",
+  "signed": true,
+  "installed": true,
+  "loginPreserved": true,
+  "finalUIState": "已连接",
+  "finalHapSha256": "634200eb71bb3c3c02b0cbd284dede1c65b5dfb43fde6d5071bb2fd5138a43da",
+  "finalHapBytes": 27616303,
+  "nativeLibrariesUnchanged": true,
+  "build": {
+    "result": "passed",
+    "tasks": 33
+  },
+  "reviews": {
+    "typescript": "reviewed",
+    "general": "APPROVE, 0 findings"
+  },
+  "tests": [
+    {
+      "name": "automatic VPN startup",
+      "result": "passed"
+    },
+    {
+      "name": "disconnect and reconnect",
+      "result": "passed"
+    },
+    {
+      "name": "browser HTTP via Tailscale IPv4",
+      "result": "passed",
+      "serverStatus": 200,
+      "finalArtifactTestTime": "22:43:30",
+      "source": "phone Tailscale IP"
+    },
+    {
+      "name": "browser HTTP after reconnect",
+      "result": "passed",
+      "serverStatus": 200,
+      "time": "22:39:36"
+    },
+    {
+      "name": "MagicDNS browser HTTP",
+      "result": "not passed",
+      "cause": "not determined"
+    },
+    {
+      "name": "HDC shell ICMP",
+      "result": "no reply",
+      "interpretation": "does not represent ordinary application VPN routing"
+    }
+  ],
+  "notTested": [
+    "cross-WAN connection",
+    "cellular switching",
+    "long-duration lock screen",
+    "exit nodes",
+    "subnet routes",
+    "all cancellation/timeout fault paths"
+  ],
+  "temporaryHttpServerStopped": true,
+  "temporaryLogCaptureStopped": true
+}

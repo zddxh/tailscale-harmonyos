@@ -1,0 +1,25 @@
+{
+  "application": {
+    "repository": "https://github.com/flypigJ/Tailscale-OHOS",
+    "tag": "v0.3.19-release",
+    "commit": "fbd14c5207e746389e54ff9f8f8593c46942adac"
+  },
+  "tailscale": {
+    "repository": "https://github.com/tailscale/tailscale",
+    "version": "v1.86.5",
+    "commit": "db392aed39630023f969e1961fcbced785d09358",
+    "archiveSHA256": "d62e70935491f80a87419444c8cda21b95975c086f3562865163ab2db1580c08",
+    "patch": "patches/tailscale-v1.86.5-harmony-dns.patch",
+    "patchSHA256": "d5d4c4668f62b3a84b96353f40749a1f817747251d8d178b8270764c3b5ac443",
+    "manifest": "tailscale-v1.86.5-patched.sha256",
+    "manifestSHA256": "762c2257478a7a8d2af6d6866db2215ac6182853f505c0076176ac45512a378c"
+  },
+  "goToolchain": {
+    "repository": "https://gitcode.com/openharmony-sig/ohos_golang_go.git",
+    "commit": "302a5306b6fad2f47196360b82561d1db1f954cf",
+    "version": "go1.24.5"
+  },
+  "target": "openharmony/arm64",
+  "sdk": "DevEco Studio 26.0.1.290, HarmonyOS API 26 Beta1",
+  "runtimeLibrary": "SDK aarch64-linux-ohos/libc++_shared.so"
+}

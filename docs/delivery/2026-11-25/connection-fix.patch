@@ -1,0 +1,772 @@
+--- a/entry/src/main/ets/components/BridgeStatus.ets
++++ b/entry/src/main/ets/components/BridgeStatus.ets
+@@ -3,6 +3,7 @@
+ import { vpnExtension } from '@kit.NetworkKit';
+ import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
+ import { fileIo } from '@kit.CoreFileKit';
++import { hilog } from '@kit.PerformanceAnalysisKit';
+ import { LengthMetrics } from '@kit.ArkUI';
+ import {
+   BlurStrategy,
+@@ -16,6 +17,7 @@
+ } from '@kit.UIDesignKit';
+ 
+ const MIN_CONNECTION_LOADING_MS: number = 1400;
++const VPN_HEARTBEAT_TIMEOUT_MS: number = 120000;
+ 
+ interface ExitNodeChoice {
+   id: string;
+@@ -97,6 +99,7 @@
+   @State loginHandoffStatus: string = 'Secure Login Pending';
+   @State controlProbeStatus: string = 'Control TLS Probe Pending';
+   @State vpnStatus: string = 'HarmonyOS VPN Extension Stopped';
++  @State connectionFailureDetail: string = '';
+   @State magicDNSProbeStatus: string = 'MagicDNS Probe Pending';
+   @State exitNodes: ExitNodeChoice[] = [];
+   @State peers: PeerSummary[] = [];
+@@ -133,6 +136,11 @@
+   private connectionPollTimer: number = -1;
+   private connectionCompletionTimer: number = -1;
+   private connectionStartedAtMs: number = 0;
++  private vpnFailureAtMs: number = 0;
++  private extensionStartupFailed: boolean = false;
++  private vpnBackendNeedsRestore: boolean = false;
++  private vpnRequestStartedAtMs: number = 0;
++  private vpnRequestAcceptedAtMs: number = 0;
+   private healthPollTimer: number = -1;
+   private loginPollTimer: number = -1;
+   private magicDNSProbeUrl: string = '';
+@@ -159,8 +167,10 @@
+     this.loadAppVersion();
+     const vpnIsLive: boolean = this.refreshVpnProbeStatus();
+     if (!vpnIsLive) {
+-      this.startBackend();
+-      this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
++      if (!this.isConnecting() && !this.extensionStartupFailed && !this.vpnBackendNeedsRestore) {
++        this.startBackend();
++        this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
++      }
+     } else {
+       this.backendReady = true;
+       this.devicesLoading = false;
+@@ -170,7 +180,8 @@
+     // process that was killed just before the UI appeared (for example during
+     // an application update) while its last heartbeat still looked current.
+     this.scheduleLifecycleTask(() => {
+-      if (!this.refreshVpnProbeStatus()) {
++      if (!this.isConnecting() && !this.refreshVpnProbeStatus() &&
++        !this.extensionStartupFailed && !this.vpnBackendNeedsRestore) {
+         this.startBackend();
+         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
+       }
+@@ -456,6 +467,10 @@
+       return;
+     }
+     this.clearConnectionCompletionTimer();
++    this.connectionFailureDetail = '';
++    this.vpnFailureAtMs = 0;
++    this.vpnRequestStartedAtMs = 0;
++    this.vpnRequestAcceptedAtMs = 0;
+     this.connectionStartedAtMs = Date.now();
+     this.setConnectInProgress(true);
+     // Let the button render its loading state before the native/VPN calls.
+@@ -463,33 +478,88 @@
+   }
+ 
+   private async startVpnProbe(): Promise<void> {
+-    const backendConfig: string = await nativeBridge.backendVpnConfigAsync();
+-    if (backendConfig.startsWith('FAILED')) {
+-      this.vpnStatus = 'Sign in to Tailscale before connecting';
+-      this.clearConnectionCompletionTimer();
+-      this.setConnectInProgress(false);
+-      return;
+-    }
+-    const magicDNSProbeUrl: string = await nativeBridge.backendMagicDNSProbeURLAsync();
+-    if (magicDNSProbeUrl.startsWith('http://')) {
+-      this.magicDNSProbeUrl = magicDNSProbeUrl;
+-      this.magicDNSProbeStatus = 'MagicDNS identity-redacted probe ready';
+-    } else {
+-      this.magicDNSProbeUrl = '';
+-      this.magicDNSProbeStatus = magicDNSProbeUrl;
+-    }
+-    this.backendStatus = await nativeBridge.backendStopAsync();
+-    this.vpnStatus = 'Requesting HarmonyOS VPN authorization';
+-    vpnExtension.startVpnExtensionAbility(this.vpnWant())
+-      .then(() => {
+-        this.vpnStatus = 'HarmonyOS VPN Extension start requested';
+-        this.startConnectionPolling();
+-      })
+-      .catch((error: BusinessError) => {
+-        this.vpnStatus = `FAILED | VPN start | code=${error.code}`;
+-        this.clearConnectionCompletionTimer();
+-        this.setConnectInProgress(false);
+-      });
++    let backendStopRequested: boolean = false;
++    try {
++      const retryExtensionFailure: boolean = this.extensionStartupFailed;
++      const restoreBackend: boolean = retryExtensionFailure || this.vpnBackendNeedsRestore;
++      if (retryExtensionFailure) {
++        // Stop the failed extension before reclaiming its persistent backend.
++        await vpnExtension.stopVpnExtensionAbility(this.vpnWant());
++        this.extensionStartupFailed = false;
++      }
++      if (restoreBackend) {
++        this.vpnBackendNeedsRestore = false;
++        this.startBackend();
++      }
++      let backendConfig: string = await nativeBridge.backendVpnConfigAsync();
++      for (let attempt: number = 0; restoreBackend && backendConfig.startsWith('FAILED') &&
++        attempt < 60; attempt++) {
++        await new Promise<void>((resolve: () => void) => {
++          setTimeout(resolve, 250);
++        });
++        backendConfig = await nativeBridge.backendVpnConfigAsync();
++      }
++      if (backendConfig.startsWith('FAILED')) {
++        const snapshotText: string = await nativeBridge.backendSnapshot();
++        const snapshot: BackendSnapshot = JSON.parse(snapshotText) as BackendSnapshot;
++        this.backendStatus = snapshot.status;
++        if (snapshot.status.includes('state=Starting')) {
++          // A bounded data-plane probe can establish a direct peer path when
++          // the control session is authenticated but DERP is unavailable.
++          await nativeBridge.backendPeerProbeAsync();
++          backendConfig = await nativeBridge.backendVpnConfigAsync();
++        }
++      }
++      if (backendConfig.startsWith('FAILED')) {
++        this.failVpnConnection(backendConfig, '连接准备未完成，请稍后重试。');
++        return;
++      }
++      const magicDNSProbeUrl: string = await nativeBridge.backendMagicDNSProbeURLAsync();
++      if (magicDNSProbeUrl.startsWith('http://')) {
++        this.magicDNSProbeUrl = magicDNSProbeUrl;
++        this.magicDNSProbeStatus = 'MagicDNS identity-redacted probe ready';
++      } else {
++        this.magicDNSProbeUrl = '';
++        this.magicDNSProbeStatus = magicDNSProbeUrl;
++      }
++      backendStopRequested = true;
++      this.backendStatus = await nativeBridge.backendStopAsync();
++      if (this.backendStatus.startsWith('FAILED')) {
++        this.failVpnConnection(this.backendStatus, '连接准备失败，请重试。');
++        this.startBackend();
++        this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
++        return;
++      }
++      this.vpnStatus = 'Requesting HarmonyOS VPN authorization';
++      this.vpnRequestStartedAtMs = Date.now();
++      await vpnExtension.startVpnExtensionAbility(this.vpnWant());
++      this.vpnRequestAcceptedAtMs = Date.now();
++      this.vpnStatus = 'HarmonyOS VPN Extension start requested';
++      this.startConnectionPolling();
++    } catch (error) {
++      const businessError = error as BusinessError;
++      const code: number = businessError.code ?? -1;
++      hilog.error(0x0000, 'TailscaleVpnUI', 'VPN start failed. code=%{public}d message=%{public}s',
++        code, businessError.message ?? 'unknown');
++      this.failVpnConnection(`FAILED | VPN start | code=${code}`,
++        code >= 0 ? `连接失败（错误码 ${code}），请重试。` : '连接失败，请重试。');
++      if (backendStopRequested) {
++        // A rejected VPN authorization leaves no extension to own the core.
++        // Restore the UI backend so the next Connect attempt can obtain config.
++        this.startBackend();
++        this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
++      }
++    }
++  }
++
++  private failVpnConnection(status: string, detail: string): void {
++    this.vpnStatus = status;
++    this.connectionFailureDetail = detail;
++    this.vpnFailureAtMs = Date.now();
++    this.vpnRequestAcceptedAtMs = 0;
++    this.clearConnectionCompletionTimer();
++    this.stopConnectionPolling();
++    this.setConnectInProgress(false);
+   }
+ 
+   private runMagicDNSProbe(): void {
+@@ -564,7 +634,10 @@
+       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+       const statusPath: string = `${context.filesDir}/vpn-probe-status.txt`;
+       if (!fileIo.accessSync(statusPath)) {
+-        this.vpnStatus = 'HarmonyOS VPN Extension Stopped';
++        this.expireMissingVpnHeartbeat(0);
++        if (!this.connectInProgress && this.connectionFailureDetail.length === 0) {
++          this.vpnStatus = 'HarmonyOS VPN Extension Stopped';
++        }
+         return false;
+       }
+       const persistedStatus: string = fileIo.readTextSync(statusPath);
+@@ -574,20 +647,69 @@
+       const heartbeatIsFresh: boolean = heartbeatMs > 0 && heartbeatAgeMs >= 0 && heartbeatAgeMs <= 5000;
+       const visibleStatus: string = persistedStatus.replace(/\s*\|\s*heartbeatMs=\d+/, '');
+       const extensionIsLive: boolean = heartbeatIsFresh && !visibleStatus.includes('destroyed');
++      // A previous session's file must not complete a new attempt or erase a
++      // useful start error before the new extension has written its own status.
++      if ((this.connectInProgress && heartbeatMs < this.connectionStartedAtMs) ||
++        (this.connectionFailureDetail.length > 0 && heartbeatMs <= this.vpnFailureAtMs)) {
++        this.expireMissingVpnHeartbeat(heartbeatMs);
++        return false;
++      }
++      if (visibleStatus.includes('destroyed') && heartbeatMs >= this.connectionStartedAtMs &&
++        !this.connectInProgress && this.extensionStartupFailed) {
++        this.extensionStartupFailed = false;
++        this.vpnBackendNeedsRestore = true;
++        return false;
++      }
++      if (visibleStatus.includes('destroyed') && this.connectInProgress &&
++        this.vpnRequestAcceptedAtMs > 0 && heartbeatMs >= this.vpnRequestStartedAtMs) {
++        // onDestroy is already terminal; retry must restore the UI core rather
++        // than request another stop against an extension that has exited.
++        this.extensionStartupFailed = false;
++        this.vpnBackendNeedsRestore = true;
++        this.failVpnConnection('FAILED | VPN connection cancelled | extension destroyed',
++          'VPN 连接已结束，请重试。');
++        return false;
++      }
++      // Terminal failures are written once, so they remain meaningful even
++      // when the UI resumes after the heartbeat freshness window has elapsed.
++      if (visibleStatus.startsWith('FAILED')) {
++        if (this.connectInProgress || heartbeatIsFresh) {
++          this.extensionStartupFailed = true;
++        }
++        this.failVpnConnection(visibleStatus, 'VPN 连接失败，请重试。');
++        return false;
++      }
++      if (this.expireMissingVpnHeartbeat(heartbeatMs)) {
++        return false;
++      }
++      if (!extensionIsLive) {
++        this.clearConnectionCompletionTimer();
++        if (!this.connectInProgress && this.connectionFailureDetail.length === 0) {
++          this.vpnStatus = visibleStatus.startsWith('FAILED') ? visibleStatus :
++            'HarmonyOS VPN Extension Stopped (previous session ended)';
++        }
++        return false;
++      }
+       if (visibleStatus.includes('state=Running') && this.connectInProgress) {
+         const remainingMs: number = MIN_CONNECTION_LOADING_MS -
+           (Date.now() - this.connectionStartedAtMs);
+         if (remainingMs > 0) {
+           if (this.connectionCompletionTimer < 0) {
+             this.connectionCompletionTimer = setTimeout(() => {
+-              this.commitConnectedStatus(visibleStatus);
++              this.commitConnectedStatus();
+             }, remainingMs);
+           }
+           return extensionIsLive;
+         }
+       }
+-      this.vpnStatus = !extensionIsLive && visibleStatus.includes('tun=true') ?
+-        'HarmonyOS VPN Extension Stopped (previous session ended)' : visibleStatus;
++      this.vpnStatus = visibleStatus;
++      if (visibleStatus.includes('state=Running')) {
++        this.connectionFailureDetail = '';
++        this.vpnFailureAtMs = 0;
++        this.extensionStartupFailed = false;
++        this.vpnBackendNeedsRestore = false;
++        this.vpnRequestAcceptedAtMs = 0;
++      }
+       if (visibleStatus.includes('state=Running') || visibleStatus.startsWith('FAILED')) {
+         this.clearConnectionCompletionTimer();
+         this.setConnectInProgress(false);
+@@ -598,6 +720,23 @@
+       this.vpnStatus = `FAILED | VPN status file | code=${businessError.code}`;
+       return false;
+     }
++  }
++
++  private expireMissingVpnHeartbeat(heartbeatMs: number): boolean {
++    if (!this.connectInProgress || this.vpnRequestAcceptedAtMs <= 0) {
++      return false;
++    }
++    const currentHeartbeat: number = heartbeatMs >= this.connectionStartedAtMs && heartbeatMs <= Date.now() ?
++      heartbeatMs : 0;
++    const lastActivityMs: number = Math.max(this.vpnRequestAcceptedAtMs, currentHeartbeat);
++    if (Date.now() - lastActivityMs < VPN_HEARTBEAT_TIMEOUT_MS) {
++      return false;
++    }
++    // Absence of a heartbeat does not prove that the extension exited. Keep
++    // the stop-before-restore path for the next explicit connection attempt.
++    this.extensionStartupFailed = true;
++    this.failVpnConnection('FAILED | VPN startup | heartbeat timeout', 'VPN 连接超时，请重试。');
++    return true;
+   }
+ 
+   private startConnectionPolling(): void {
+@@ -624,13 +763,13 @@
+     }
+   }
+ 
+-  private commitConnectedStatus(status: string): void {
++  private commitConnectedStatus(): void {
+     this.clearConnectionCompletionTimer();
+-    // Commit both states in the same render transaction so the progress
+-    // indicator disappears on the frame where the connected panel appears.
+-    this.vpnStatus = status;
+-    this.setConnectInProgress(false);
+-    this.stopConnectionPolling();
++    // Re-read the heartbeat: the extension may have stopped during the delay.
++    this.refreshVpnProbeStatus();
++    if (this.isConnected()) {
++      this.stopConnectionPolling();
++    }
+   }
+ 
+   private startHealthPolling(): void {
+@@ -829,6 +968,9 @@
+   }
+ 
+   private connectionDescription(): ResourceStr {
++    if (this.connectionFailureDetail.length > 0) {
++      return this.connectionFailureDetail;
++    }
+     if (this.isBackendLoading()) {
+       return $r('app.string.description_starting');
+     }
+--- a/entry/src/main/ets/vpnextensionability/TailscaleVpnExtensionAbility.ets
++++ b/entry/src/main/ets/vpnextensionability/TailscaleVpnExtensionAbility.ets
+@@ -18,6 +18,8 @@
+   private tunFd: number = -1;
+   private statusTimer: number = -1;
+   private statusUpdateInFlight: boolean = false;
++  private destroyed: boolean = false;
++  private latestStatus: string = '';
+ 
+   onCreate(want: Want): void {
+     this.writeStatus('VPN extension lifecycle entered');
+@@ -25,152 +27,150 @@
+     try {
+       this.vpnConnection = vpnExtension.createVpnConnection(this.context);
+       this.writeStatus('VPN connection object created');
+-      this.createProbeTun();
++      this.startStartupHeartbeat();
++      this.createProbeTun().catch((error: BusinessError) => {
++        this.failStartup(`FAILED | VPN startup | code=${error.code ?? -1}`);
++        hilog.error(DOMAIN, TAG, 'VPN startup failed. code=%{public}d', error.code ?? -1);
++      });
+     } catch (error) {
+       const businessError = error as BusinessError;
+-      this.writeStatus(`FAILED | VPN connection object | code=${businessError.code ?? -1}`);
++      this.failStartup(`FAILED | VPN connection object | code=${businessError.code ?? -1}`);
+       hilog.error(DOMAIN, TAG, 'VPN connection initialization failed. code=%{public}d',
+         businessError.code ?? -1);
+     }
+   }
+ 
+   private async createProbeTun(): Promise<void> {
+-    if (this.vpnConnection === undefined) {
+-      return;
+-    }
+-
+-    // Until login is complete, use a documentation-only route that cannot
+-    // intercept normal device traffic. Once the persistent backend is Running,
+-    // replace it with the assigned Tailscale addresses and tailnet ranges.
+-    let backendReady: boolean = false;
+-    let config: vpnExtension.VpnConfig = {
+-      addresses: [{
+-        address: { address: '192.0.2.1', family: 1 },
+-        prefixLength: 32
+-      }],
+-      routes: [{
+-        interface: 'vpn-tun',
+-        destination: {
+-          address: { address: '192.0.2.0', family: 1 },
+-          prefixLength: 24
+-        },
+-        gateway: { address: '0.0.0.0', family: 1 },
+-        hasGateway: false,
+-        isDefaultRoute: false
+-      }],
+-      mtu: 1280,
+-      isIPv4Accepted: true,
+-      isIPv6Accepted: false,
+-      isBlocking: false,
+-      trustedApplications: [BUNDLE_NAME]
+-    };
++    const connection = this.vpnConnection;
++    if (connection === undefined) {
++      return;
++    }
++
+     // HarmonyOS starts a VPN Extension in its own application process. The
+     // UI process may have already authenticated, but its in-memory Go backend
+     // is not shared with this process. Restore the backend from the persistent
+     // state directory here and wait until the assigned addresses are ready.
+     const backendConfigText: string = await this.restoreBackendVpnConfig();
+-    if (!backendConfigText.startsWith('FAILED')) {
+-      const configParts: string[] = backendConfigText.split('|');
+-      if (configParts.length >= 2 && configParts[0].length > 0) {
+-        const addresses: vpnExtension.LinkAddress[] = [{
+-          address: { address: configParts[0], family: 1 },
+-          prefixLength: 32
+-        }];
+-        const routes: vpnExtension.RouteInfo[] = [{
++    if (this.destroyed) {
++      return;
++    }
++    if (backendConfigText.startsWith('FAILED')) {
++      this.failStartup(backendConfigText);
++      return;
++    }
++    const configParts: string[] = backendConfigText.split('|');
++    if (configParts.length < 2 || configParts[0].length === 0) {
++      this.failStartup('FAILED | VPN config | invalid address payload');
++      return;
++    }
++    const addresses: vpnExtension.LinkAddress[] = [{
++      address: { address: configParts[0], family: 1 },
++      prefixLength: 32
++    }];
++    const routes: vpnExtension.RouteInfo[] = [{
++      interface: 'vpn-tun',
++      destination: {
++        address: { address: '100.64.0.0', family: 1 },
++        prefixLength: 10
++      },
++      gateway: { address: '0.0.0.0', family: 1 },
++      hasGateway: false,
++      isDefaultRoute: false
++    }];
++    if (configParts[1].length > 0) {
++      addresses.push({
++        address: { address: configParts[1], family: 2 },
++        prefixLength: 128
++      });
++      routes.push({
++        interface: 'vpn-tun',
++        destination: {
++          address: { address: 'fd7a:115c:a1e0::', family: 2 },
++          prefixLength: 48
++        },
++        gateway: { address: '::', family: 2 },
++        hasGateway: false,
++        isDefaultRoute: false
++      });
++    }
++    if (configParts.length >= 3 && configParts[2].length > 0) {
++      const dynamicRoutes: string[] = configParts[2].split(',');
++      for (const routeText of dynamicRoutes) {
++        const prefixParts: string[] = routeText.split('/');
++        if (prefixParts.length !== 2) {
++          continue;
++        }
++        const family: number = prefixParts[0].includes(':') ? 2 : 1;
++        const prefixLength: number = Number(prefixParts[1]);
++        routes.push({
+           interface: 'vpn-tun',
+           destination: {
+-            address: { address: '100.64.0.0', family: 1 },
+-            prefixLength: 10
++            address: { address: prefixParts[0], family: family },
++            prefixLength: prefixLength
+           },
+-          gateway: { address: '0.0.0.0', family: 1 },
++          gateway: { address: family === 2 ? '::' : '0.0.0.0', family: family },
+           hasGateway: false,
+-          isDefaultRoute: false
+-        }];
+-        if (configParts[1].length > 0) {
+-          addresses.push({
+-            address: { address: configParts[1], family: 2 },
+-            prefixLength: 128
+-          });
+-          routes.push({
+-            interface: 'vpn-tun',
+-            destination: {
+-              address: { address: 'fd7a:115c:a1e0::', family: 2 },
+-              prefixLength: 48
+-            },
+-            gateway: { address: '::', family: 2 },
+-            hasGateway: false,
+-            isDefaultRoute: false
+-          });
+-        }
+-        if (configParts.length >= 3 && configParts[2].length > 0) {
+-          const dynamicRoutes: string[] = configParts[2].split(',');
+-          for (const routeText of dynamicRoutes) {
+-            const prefixParts: string[] = routeText.split('/');
+-            if (prefixParts.length !== 2) {
+-              continue;
+-            }
+-            const family: number = prefixParts[0].includes(':') ? 2 : 1;
+-            const prefixLength: number = Number(prefixParts[1]);
+-            routes.push({
+-              interface: 'vpn-tun',
+-              destination: {
+-                address: { address: prefixParts[0], family: family },
+-                prefixLength: prefixLength
+-              },
+-              gateway: { address: family === 2 ? '::' : '0.0.0.0', family: family },
+-              hasGateway: false,
+-              isDefaultRoute: prefixLength === 0
+-            });
+-          }
+-        }
+-        const useTailscaleDNS: boolean = configParts.length >= 4 && configParts[3] === 'true';
+-        config = {
+-          addresses: addresses,
+-          routes: routes,
+-          dnsAddresses: useTailscaleDNS ? ['100.100.100.100'] : [],
+-          mtu: 1280,
+-          isIPv4Accepted: true,
+-          isIPv6Accepted: configParts[1].length > 0,
+-          isBlocking: false,
+-          blockedApplications: [BUNDLE_NAME]
+-        };
+-        backendReady = true;
+-      }
+-    }
++          isDefaultRoute: prefixLength === 0
++        });
++      }
++    }
++    const useTailscaleDNS: boolean = configParts.length >= 4 && configParts[3] === 'true';
++    const config: vpnExtension.VpnConfig = {
++      addresses: addresses,
++      routes: routes,
++      dnsAddresses: useTailscaleDNS ? ['100.100.100.100'] : [],
++      mtu: 1280,
++      isIPv4Accepted: true,
++      isIPv6Accepted: configParts[1].length > 0,
++      isBlocking: false,
++      blockedApplications: [BUNDLE_NAME]
++    };
+ 
+     // A development reinstall can terminate the prior extension before its
+     // asynchronous onDestroy cleanup finishes. destroy() is scoped to this
+     // application's VPN connection and makes startup idempotent.
+     this.writeStatus('Removing stale application VPN instance');
+     try {
+-      await this.vpnConnection.destroy();
++      await connection.destroy();
+     } catch (_cleanupError) {
+       // No existing connection is also a valid clean state.
+     }
+ 
++    if (this.destroyed) {
++      return;
++    }
+     try {
+       this.writeStatus('VPN probe TUN creation pending');
+-      this.tunFd = await this.vpnConnection.create(config);
++      this.tunFd = await connection.create(config);
++      if (this.destroyed) {
++        await connection.destroy();
++        return;
++      }
+       const probeStatus: string = nativeBridge.tunFdProbe(this.tunFd);
+-      if (backendReady && probeStatus.startsWith('OK')) {
++      if (probeStatus.startsWith('OK')) {
+         const restartStatus: string = nativeBridge.backendRestartWithTun(
+           `${this.context.filesDir}/tailscale`, this.deviceModel(), this.tunFd);
+         const finalStatus: string = await this.waitForVpnBackend(restartStatus);
++        if (this.destroyed) {
++          return;
++        }
++        if (!finalStatus.includes('state=Running')) {
++          this.failStartup(finalStatus);
++          return;
++        }
+         this.writeStatus(finalStatus);
+-        if (finalStatus.includes('state=Running')) {
+-          await nativeBridge.backendArmMagicDNSProbeAsync();
+-          this.writePeerStatus(await nativeBridge.backendPeerProbeAsync());
+-          this.startStatusUpdates();
+-        }
++        this.startStatusUpdates();
++        // Optional diagnostics must not delay heartbeats or fail a working VPN.
++        this.runPeerProbes().catch(() => {
++          this.writePeerStatus('FAILED | peer diagnostics | unavailable');
++        });
+       } else {
+-        const backendState: string = backendConfigText.startsWith('FAILED') ?
+-          backendConfigText : 'FAILED | VPN config | invalid address payload';
+-        this.writeStatus(`${probeStatus} | ${backendState}`);
++        this.failStartup(`FAILED | VPN TUN descriptor | ${probeStatus}`);
+       }
+       hilog.info(DOMAIN, TAG, 'VPN probe TUN created. bridge=%{public}s', probeStatus);
+     } catch (error) {
+       const businessError = error as BusinessError;
+-      this.writeStatus(`FAILED | VPN probe TUN | code=${businessError.code ?? -1}`);
++      this.failStartup(`FAILED | VPN probe TUN | code=${businessError.code ?? -1}`);
+       hilog.error(DOMAIN, TAG, 'VPN probe TUN creation failed. code=%{public}d',
+         businessError.code ?? -1);
+     }
+@@ -178,12 +178,32 @@
+ 
+   private async restoreBackendVpnConfig(): Promise<string> {
+     const stateDir: string = `${this.context.filesDir}/tailscale`;
+-    nativeBridge.backendStart(stateDir, this.deviceModel());
++    const startStatus: string = nativeBridge.backendStart(stateDir, this.deviceModel());
++    if (startStatus.startsWith('FAILED')) {
++      return startStatus;
++    }
++    this.writeStatus('VPN backend starting | restoring authenticated session');
+     let configStatus: string = 'FAILED | VPN config | backend restore timeout';
+-    for (let attempt: number = 0; attempt < 60; attempt++) {
+-      configStatus = nativeBridge.backendVpnConfig();
++    let peerBootstrapAttempted: boolean = false;
++    // The native startup restores network and exit-node preferences with two
++    // bounded 15-second waits before exposing its current backend state.
++    const deadlineMs: number = Date.now() + 45000;
++    while (Date.now() < deadlineMs) {
++      if (this.destroyed) {
++        return 'FAILED | VPN startup | cancelled';
++      }
++      configStatus = await nativeBridge.backendVpnConfigAsync();
+       if (!configStatus.startsWith('FAILED')) {
+         return configStatus;
++      }
++      if (!peerBootstrapAttempted && !this.destroyed) {
++        const snapshotText: string = await nativeBridge.backendSnapshot();
++        const status: string = (JSON.parse(snapshotText) as BackendHealthSnapshot).status;
++        if (this.canBootstrapPeer(status)) {
++          peerBootstrapAttempted = true;
++          await this.bootstrapPeer();
++          continue;
++        }
+       }
+       await new Promise<void>((resolve: () => void) => {
+         setTimeout(resolve, 250);
+@@ -205,17 +225,92 @@
+       return initialStatus;
+     }
+     let backendStatus: string = initialStatus;
+-    for (let attempt: number = 0; attempt < 60; attempt++) {
++    let peerBootstrapAttempted: boolean = false;
++    const deadlineMs: number = Date.now() + 45000;
++    while (Date.now() < deadlineMs) {
++      if (this.destroyed) {
++        return 'FAILED | VPN startup | cancelled';
++      }
+       const snapshotText: string = await nativeBridge.backendSnapshot();
+       backendStatus = (JSON.parse(snapshotText) as BackendHealthSnapshot).status;
+       if (backendStatus.includes('state=Running') || backendStatus.startsWith('FAILED')) {
+         return backendStatus;
+       }
++      if (!peerBootstrapAttempted && this.canBootstrapPeer(backendStatus)) {
++        peerBootstrapAttempted = true;
++        await this.bootstrapPeer();
++        continue;
++      }
+       await new Promise<void>((resolve: () => void) => {
+         setTimeout(resolve, 250);
+       });
+     }
+     return 'FAILED | VPN backend | restart timeout';
++  }
++
++  private canBootstrapPeer(status: string): boolean {
++    return !this.destroyed && status.includes('state=Starting') &&
++      /tailscaleIPs=[1-9][0-9]*(?: |$)/.test(status);
++  }
++
++  private async bootstrapPeer(): Promise<void> {
++    this.writeStatus('VPN backend starting | establishing peer transport');
++    try {
++      // Native TSMP probing has a 10-second context and cannot grant login.
++      // A live peer can advance Starting when a DERP relay is unavailable.
++      this.writePeerStatus(await nativeBridge.backendPeerProbeAsync());
++    } catch (_error) {
++      this.writePeerStatus('FAILED | peer bootstrap | unavailable');
++    }
++  }
++
++  private startStartupHeartbeat(): void {
++    this.statusTimer = setInterval(() => {
++      this.writeStatus(this.latestStatus);
++    }, 1000);
++  }
++
++  private async runPeerProbes(): Promise<void> {
++    await nativeBridge.backendArmMagicDNSProbeAsync();
++    if (!this.destroyed) {
++      this.writePeerStatus(await nativeBridge.backendPeerProbeAsync());
++    }
++  }
++
++  private stopStatusUpdates(): void {
++    if (this.statusTimer >= 0) {
++      clearInterval(this.statusTimer);
++      this.statusTimer = -1;
++    }
++  }
++
++  private failStartup(status: string): void {
++    if (this.destroyed) {
++      return;
++    }
++    this.stopStatusUpdates();
++    this.writeStatus(status);
++    this.cleanupBackend();
++    const connection = this.vpnConnection;
++    if (connection !== undefined) {
++      connection.destroy().catch((error: BusinessError) => {
++        hilog.error(DOMAIN, TAG, 'Failed VPN cleanup. code=%{public}d', error.code ?? -1);
++      });
++    }
++  }
++
++  private cleanupBackend(): void {
++    try {
++      nativeBridge.backendStopAsync().then((status: string) => {
++        if (status.startsWith('FAILED')) {
++          hilog.error(DOMAIN, TAG, 'VPN backend cleanup failed');
++        }
++      }).catch(() => {
++        hilog.error(DOMAIN, TAG, 'VPN backend cleanup unavailable');
++      });
++    } catch (_error) {
++      hilog.error(DOMAIN, TAG, 'VPN backend cleanup could not start');
++    }
+   }
+ 
+   private startStatusUpdates(): void {
+@@ -223,7 +318,7 @@
+       clearInterval(this.statusTimer);
+     }
+     this.statusTimer = setInterval(() => {
+-      if (this.statusUpdateInFlight) {
++      if (this.destroyed || this.statusUpdateInFlight) {
+         return;
+       }
+       this.statusUpdateInFlight = true;
+@@ -242,10 +337,17 @@
+   }
+ 
+   private writePeerStatus(status: string): void {
++    if (this.destroyed) {
++      return;
++    }
+     this.writeTextFile(`${this.context.filesDir}/vpn-peer-probe-status.txt`, status);
+   }
+ 
+   private writeStatus(status: string): void {
++    if (this.destroyed) {
++      return;
++    }
++    this.latestStatus = status;
+     this.writeTextFile(`${this.context.filesDir}/vpn-probe-status.txt`,
+       `${status} | heartbeatMs=${Date.now()}`);
+   }
+@@ -270,14 +372,13 @@
+   }
+ 
+   onDestroy(): void {
+-    if (this.statusTimer >= 0) {
+-      clearInterval(this.statusTimer);
+-      this.statusTimer = -1;
+-    }
++    this.stopStatusUpdates();
++    this.writeStatus('VPN extension destroyed');
++    this.destroyed = true;
++    this.cleanupBackend();
+     const connection = this.vpnConnection;
+     this.vpnConnection = undefined;
+     this.tunFd = -1;
+-    this.writeStatus('VPN extension destroyed');
+     if (connection !== undefined) {
+       connection.destroy().catch((error: BusinessError) => {
+         hilog.error(DOMAIN, TAG, 'VPN destroy failed. code=%{public}d', error.code);

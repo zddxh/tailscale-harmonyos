@@ -1,0 +1,32 @@
+{
+  "date": "2026-11-26",
+  "device": "HarmonyOS 7 / API 26 / arm64",
+  "bundle": "com.example.tailscaleharmony",
+  "signedHAP": {
+    "file": "tailscale-harmonyos-dns-fix-signed.hap",
+    "bytes": 27664206,
+    "sha256": "13011288643b370b142aef314b2996e6e68a88ee02fdea38240a63ca8067f4d8"
+  },
+  "packagedNativeSHA256": {
+    "libtailscale_go.so": "cf5d93b8cb7d70ac752911a37f4149a610954a703133b44ff21698e385dfc651",
+    "libtailscale_ohos.so": "25055513b68d3fc1bd89dd2a64b67fc7f6e2a8d5beeab4579f3a58b18dedfbb5",
+    "libc++_shared.so": "f9e10eb9b8b560bd82d72a46882a2810ae2bd9d884e39d6db248f343d23649f6"
+  },
+  "nativePackaging": "Go and NAPI match locally rebuilt binaries after SDK llvm-strip --strip-all; libc++ matches SDK binary exactly",
+  "checks": {
+    "dnsRegressionRace": "PASS",
+    "goVet": "PASS",
+    "fullGoSuite": "Known pre-existing TestClassifyPeerDevice/laptop failure: ThinkPad classified as tablet",
+    "nativeBuild": "PASS",
+    "arktsBuildAndSigning": "PASS",
+    "replacementInstall": "PASS",
+    "ownerTest": "User confirmed the installed app works",
+    "serverObservation": "After installation, HTTP test server received GET /check.txt?case=new-network-dns with status 200 from phone Tailscale IP at 09:19:19 local time; server stopped after testing",
+    "reviews": "Go, C++, ArkTS and general integration reviews approved"
+  },
+  "limits": [
+    "Browser address and DNS counters were not re-captured after owner resumed use; full MagicDNS/reconnect matrix not independently completed",
+    "Short-name search, custom tailnet DNS server transport, live network switching not verified",
+    "Development signing is device-limited; signing materials excluded from source archive"
+  ]
+}
