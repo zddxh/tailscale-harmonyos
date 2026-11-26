@@ -1,0 +1,200 @@
+{
+  "sourceCommit": "fbd14c5207e746389e54ff9f8f8593c46942adac",
+  "sourceArchiveSha256": "797f8243208e1ad4cec376efcd6b7d9b1d796870bd1985424e70304466405194",
+  "sourceArchivesContentIdentical": true,
+  "upstream": {
+    "source": "https://github.com/flypigJ/Tailscale-OHOS/releases/tag/v0.3.19-release",
+    "asset_url": "https://github.com/flypigJ/Tailscale-OHOS/releases/download/v0.3.19-release/Tailscale-OHOS-0.3.19-release-signed.hap",
+    "asset_id": 478716888,
+    "hap_size": 27410628,
+    "hap_sha256": "c8c5c51817708f587e5be1a7ddb54b15b9dd396026e7a78e5ee77f4c85f96c73",
+    "zip_paths_safe": true,
+    "zip_crc_verified": true,
+    "upstream_app_metadata": {
+      "iconId": 16777217,
+      "minPatchAPIVersion": 0,
+      "debug": false,
+      "targetPatchAPIVersion": 0,
+      "minMinorAPIVersion": 0,
+      "minAPIVersion": 60100023,
+      "icon": "$media:app_icon",
+      "buildMode": "release",
+      "label": "$string:app_name",
+      "bundleType": "app",
+      "versionName": "0.3.19-release",
+      "versionCode": 3190016,
+      "appEnvironments": [],
+      "compileSdkType": "HarmonyOS",
+      "labelId": 16777216,
+      "compileSdkVersion": "26.0.0.23",
+      "targetAPIVersion": 60100023,
+      "vendor": "TailscaleOHOS contributors",
+      "bundleName": "io.github.tailscaleohos",
+      "apiReleaseType": "Beta1",
+      "targetMinorAPIVersion": 0
+    },
+    "libraries": {
+      "libc++_shared.so": {
+        "sha256": "e18522ffe1a721673e5b1fa0b05731b0214958a4dd697a227502085a9217079f",
+        "size": 1262504,
+        "machine": "AArch64",
+        "class": "ELF64",
+        "needed": [
+          "libc.so"
+        ]
+      },
+      "libtailscale_ohos.so": {
+        "sha256": "af48df9bef7515f81c2e9b2ae02e69fe2b72250184e337ea9658cf98b55248b0",
+        "size": 71056,
+        "machine": "AArch64",
+        "class": "ELF64",
+        "needed": [
+          "libtailscale_go.so",
+          "libace_napi.z.so",
+          "libhilog_ndk.z.so",
+          "libc++_shared.so",
+          "libc.so"
+        ]
+      },
+      "libtailscale_go.so": {
+        "sha256": "53308484a537518250f63b93c62ad9314ca20e7df72c280f1985e52b84420817",
+        "size": 25623280,
+        "machine": "AArch64",
+        "class": "ELF64",
+        "needed": [
+          "libc.so"
+        ]
+      }
+    },
+    "copied_libraries": [
+      "libc++_shared.so",
+      "libtailscale_go.so",
+      "libtailscale_ohos.so"
+    ],
+    "expected_go_export_names_found": [
+      "TSHello",
+      "TSProbeEngine",
+      "TSBackendStart",
+      "TSBackendStop",
+      "TSBackendLogout",
+      "TSBackendStatus",
+      "TSBackendSnapshot",
+      "TSBackendAuthURL",
+      "TSBackendVPNConfig",
+      "TSBackendExitNodes",
+      "TSBackendPeers",
+      "TSBackendAccount",
+      "TSTailscaleVersion",
+      "TSBackendNetworkSettings",
+      "TSBackendSetNetworkSetting",
+      "TSBackendSetExitNode",
+      "TSBackendPeerProbe",
+      "TSBackendMagicDNSProbeURL",
+      "TSBackendArmMagicDNSProbe",
+      "TSBackendRestartWithTun",
+      "TSControlProbe",
+      "TSTunFDProbe",
+      "TSFreeString"
+    ],
+    "expected_napi_property_strings_found": [
+      "hello",
+      "probeEngine",
+      "probeEngineAsync",
+      "backendStart",
+      "backendStop",
+      "backendLogout",
+      "backendStatus",
+      "backendSnapshot",
+      "backendStopAsync",
+      "backendLogoutAsync",
+      "backendAuthURLAsync",
+      "backendVpnConfigAsync",
+      "backendAuthURL",
+      "backendVpnConfig",
+      "backendExitNodes",
+      "backendPeers",
+      "backendAccount",
+      "tailscaleVersion",
+      "backendNetworkSettings",
+      "backendSetNetworkSetting",
+      "backendSetNetworkSettingAsync",
+      "backendSetExitNode",
+      "backendSetExitNodeAsync",
+      "backendPeerProbe",
+      "backendPeerProbeAsync",
+      "backendMagicDNSProbeURL",
+      "backendMagicDNSProbeURLAsync",
+      "backendArmMagicDNSProbe",
+      "backendArmMagicDNSProbeAsync",
+      "backendRestartWithTun",
+      "controlProbe",
+      "tunFdProbe"
+    ],
+    "limitations": [
+      "Published binaries were statically inspected, not executed or rebuilt.",
+      "NAPI property string presence is a static compatibility check, not a runtime registration test.",
+      "Source-to-binary correspondence relies on the upstream release; reproducible Go/C++ rebuild was not performed.",
+      "Original HAP has debug=false and upstream development provisioning; its signature is not reused for the local app."
+    ]
+  },
+  "builtHap": {
+    "artifact": "/Users/dacheng/Documents/Codex/2026-11-25/https-github-com-tailscale-https-github/work/mesharc-v0.3.19/entry/build/default/outputs/default/entry-default-unsigned.hap",
+    "size": 27319289,
+    "sha256": "69278d200363d264a04ece78982cbe38bad7dff73ce02443768f303d83958ca2",
+    "app": {
+      "iconId": 16777217,
+      "minPatchAPIVersion": 0,
+      "debug": true,
+      "targetPatchAPIVersion": 0,
+      "minMinorAPIVersion": 0,
+      "minAPIVersion": 60100023,
+      "icon": "$media:app_icon",
+      "buildMode": "debug",
+      "label": "$string:app_name",
+      "bundleType": "app",
+      "versionName": "0.3.19-release",
+      "versionCode": 3190016,
+      "appEnvironments": [],
+      "compileSdkType": "HarmonyOS",
+      "labelId": 16777216,
+      "compileSdkVersion": "26.0.1.120",
+      "targetAPIVersion": 60100023,
+      "vendor": "TailscaleOHOS contributors",
+      "bundleName": "com.example.tailscaleharmony",
+      "apiReleaseType": "Beta1",
+      "targetMinorAPIVersion": 0
+    },
+    "moduleType": "entry",
+    "nativeLibraries": [
+      {
+        "path": "libs/arm64-v8a/libc++_shared.so",
+        "size": 1262504,
+        "sha256": "e18522ffe1a721673e5b1fa0b05731b0214958a4dd697a227502085a9217079f",
+        "matchesVerifiedInput": true
+      },
+      {
+        "path": "libs/arm64-v8a/libtailscale_ohos.so",
+        "size": 71056,
+        "sha256": "af48df9bef7515f81c2e9b2ae02e69fe2b72250184e337ea9658cf98b55248b0",
+        "matchesVerifiedInput": true
+      },
+      {
+        "path": "libs/arm64-v8a/libtailscale_go.so",
+        "size": 25623280,
+        "sha256": "53308484a537518250f63b93c62ad9314ca20e7df72c280f1985e52b84420817",
+        "matchesVerifiedInput": true
+      }
+    ],
+    "zipCrc": "pass"
+  },
+  "device": {
+    "model": "CMS-AL20",
+    "marketName": "HUAWEI Mate 90 Pro",
+    "softwareVersion": "7.0.0.115",
+    "api": 26,
+    "abi": "arm64-v8a"
+  },
+  "signed": false,
+  "installed": false,
+  "runtimeVerified": false
+}

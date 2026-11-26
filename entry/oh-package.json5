@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "0.3.19-release",
+  "description": "Tailscale OHOS application entry module",
+  "main": "",
+  "author": "TailscaleOHOS contributors",
+  "license": "BSD-3-Clause",
+  "dependencies": {
+    "libtailscale_ohos.so": "file:./src/main/cpp/types/libtailscale_ohos"
+  }
+}
