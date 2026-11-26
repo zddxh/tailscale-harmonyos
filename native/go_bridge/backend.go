@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -27,7 +29,11 @@ import (
 )
 
 type backendController struct {
+	// lifecycleMu serializes startup, close and TUN handoff; mu protects status.
+	lifecycleMu  sync.Mutex
 	mu           sync.Mutex
+	ownership    *backendOwnership
+	startDone    chan struct{}
 	dnsUpdateMu  sync.Mutex
 	dnsBase      []netip.Addr
 	dnsAdapter   *harmonyDNSConfigurator
@@ -105,30 +111,79 @@ func (b *backendController) start(stateDir, deviceModel string) string {
 }
 
 func (b *backendController) stop() string {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	if err := b.closeBackendLocked(); err != nil {
+		return "FAILED | backend stop"
+	}
+	if err := b.releaseOwnershipLocked(); err != nil {
+		return "FAILED | backend ownership release"
+	}
+	b.mu.Lock()
+	b.phase = "stopped"
+	b.startErr = ""
+	b.mu.Unlock()
+	return "OK | backend stopped"
+}
+
+// closeBackendLocked waits until startup can no longer write state before
+// invoking tsnet.Close (which must not run concurrently with tsnet.Start).
+// Ownership stays held on a close failure, so another core cannot take over
+// while the old one might still be writing. Caller holds lifecycleMu.
+func (b *backendController) closeBackendLocked() error {
 	b.mu.Lock()
 	server := b.server
 	cancelStart := b.cancelStart
+	startDone := b.startDone
 	b.generation++
-	b.server = nil
-	b.dnsAdapter = nil
 	b.client = nil
 	b.starting = false
-	b.startErr = ""
-	b.phase = "stopped"
-	b.externalTun = false
-	b.tunDevice = nil
-	b.subnetRoutes = 0
+	b.phase = "stopping"
 	b.cancelStart = nil
 	b.mu.Unlock()
 	if cancelStart != nil {
 		cancelStart()
 	}
+	if startDone != nil {
+		<-startDone
+	}
 	if server != nil {
-		if err := server.Close(); err != nil {
-			return "FAILED | backend stop"
+		if err := closeBackendServer(server); err != nil {
+			b.mu.Lock()
+			b.startErr = "backend cleanup incomplete"
+			b.mu.Unlock()
+			return err
 		}
 	}
-	return "OK | backend stopped"
+	b.mu.Lock()
+	b.server = nil
+	b.dnsAdapter = nil
+	b.externalTun = false
+	b.tunDevice = nil
+	b.subnetRoutes = 0
+	b.startDone = nil
+	b.mu.Unlock()
+	return nil
+}
+
+func closeBackendServer(server *tsnet.Server) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("backend cleanup panic")
+		}
+	}()
+	err = server.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+// Caller holds lifecycleMu; no backend may remain when ownership is released.
+func (b *backendController) releaseOwnershipLocked() error {
+	owner := b.ownership
+	b.ownership = nil
+	return owner.close()
 }
 
 // logout invalidates this node's current Tailscale login. The UI keeps this
@@ -160,11 +215,33 @@ func (b *backendController) logout() string {
 }
 
 func (b *backendController) startWithDevice(stateDir, deviceModel string, device *harmonyTunDevice) string {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	return b.startWithDeviceLocked(stateDir, deviceModel, device)
+}
+
+func (b *backendController) startWithDeviceLocked(stateDir, deviceModel string, device *harmonyTunDevice) string {
 	b.mu.Lock()
 	if b.server != nil || b.starting {
 		b.mu.Unlock()
 		return b.status()
 	}
+	b.mu.Unlock()
+	if b.ownership == nil {
+		owner, err := acquireBackendOwnership(stateDir)
+		if err != nil {
+			if device != nil {
+				_ = device.Close()
+			}
+			if errors.Is(err, errBackendOwned) {
+				return backendOwnedStatus
+			}
+			return "FAILED | backend ownership unavailable"
+		}
+		b.ownership = owner
+	}
+	stateDir = b.ownership.directory
+	b.mu.Lock()
 	// The OpenHarmony Go port intentionally matches Linux build tags, but an
 	// application process cannot use tailscaled's Linux socket marks/network
 	// namespace bypass. Use the ordinary system dialer for control traffic.
@@ -208,9 +285,11 @@ func (b *backendController) startWithDevice(stateDir, deviceModel string, device
 	b.tunDevice = device
 	b.stateDir = stateDir
 	b.cancelStart = cancelStart
+	startDone := make(chan struct{})
+	b.startDone = startDone
 	b.mu.Unlock()
 
-	go b.startAsync(server, stateDir, generation, startContext)
+	go b.startAsync(server, stateDir, generation, startContext, startDone)
 	if device != nil {
 		return "OK | VPN backend starting | persistent private state"
 	}
@@ -218,35 +297,26 @@ func (b *backendController) startWithDevice(stateDir, deviceModel string, device
 }
 
 func (b *backendController) restartWithTun(stateDir, deviceModel string, fd int) string {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
 	device, err := newHarmonyTunDevice(fd, 1280)
 	if err != nil {
 		return "FAILED | VPN backend | TUN descriptor adaptation"
 	}
 
-	b.mu.Lock()
-	oldServer := b.server
-	cancelStart := b.cancelStart
-	b.generation++
-	b.server = nil
-	b.dnsAdapter = nil
-	b.client = nil
-	b.starting = false
-	b.startErr = ""
-	b.phase = "vpn-restart"
-	b.externalTun = false
-	b.tunDevice = nil
-	b.cancelStart = nil
-	b.mu.Unlock()
-	if cancelStart != nil {
-		cancelStart()
+	if err := b.closeBackendLocked(); err != nil {
+		_ = device.Close()
+		return "FAILED | VPN backend | previous backend close"
 	}
-	if oldServer != nil {
-		if err := oldServer.Close(); err != nil {
-			_ = device.Close()
-			return "FAILED | VPN backend | previous backend close"
-		}
+	// Keep the exact same lock during UI-engine to TUN-engine replacement. A
+	// different requested directory cannot inherit ownership of the old store.
+	if directory, err := filepath.Abs(stateDir); err != nil ||
+		(b.ownership != nil && directory != b.ownership.directory) {
+		_ = device.Close()
+		_ = b.releaseOwnershipLocked()
+		return "FAILED | VPN backend | state directory changed"
 	}
-	return b.startWithDevice(stateDir, deviceModel, device)
+	return b.startWithDeviceLocked(stateDir, deviceModel, device)
 }
 
 func harmonyHostname(deviceModel string) string {
@@ -1169,20 +1239,27 @@ func (b *backendController) setPhase(phase string) {
 
 func (b *backendController) startAsync(
 	server *tsnet.Server, stateDir string, generation uint64, startContext context.Context,
+	startDone chan struct{},
 ) {
+	var startErr error
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			b.setStartErrorFor(server, generation, fmt.Errorf("panic: %v\n%s", recovered, debug.Stack()))
+			startErr = fmt.Errorf("panic: %v\n%s", recovered, debug.Stack())
+		}
+		// Unblock a concurrent stop before failure cleanup takes lifecycleMu.
+		close(startDone)
+		if startErr != nil {
+			b.setStartErrorFor(server, generation, startErr)
 		}
 	}()
 
 	if err := server.Start(); err != nil {
-		b.setStartErrorFor(server, generation, err)
+		startErr = err
 		return
 	}
 	client, err := server.LocalClient()
 	if err != nil {
-		b.setStartErrorFor(server, generation, err)
+		startErr = err
 		return
 	}
 
@@ -1211,14 +1288,21 @@ func (b *backendController) startAsync(
 }
 
 func (b *backendController) setStartErrorFor(server *tsnet.Server, generation uint64, err error) {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.server != server || b.generation != generation {
+		b.mu.Unlock()
 		return
 	}
-	b.starting = false
+	b.mu.Unlock()
+	if closeErr := b.closeBackendLocked(); closeErr != nil {
+		return
+	}
+	_ = b.releaseOwnershipLocked()
+	b.mu.Lock()
 	b.startErr = err.Error()
-	b.cancelStart = nil
+	b.mu.Unlock()
 }
 
 func (b *backendController) status() string {

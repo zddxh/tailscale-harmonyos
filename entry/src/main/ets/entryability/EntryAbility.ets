@@ -8,6 +8,8 @@ import {
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { recordLifecycle } from '../services/LocalDiagnostics';
+import { vpnExtensionBinding } from '../services/VpnExtensionBinding';
 
 const DOMAIN = 0x0000;
 const TAG = 'TailscaleOHOS';
@@ -37,6 +39,9 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    recordLifecycle(this.context.filesDir, 'ui', 'created', launchParam.lastExitReason,
+      launchParam.lastExitDetailInfo?.pid ?? 0, launchParam.lastExitDetailInfo?.timestamp ?? 0);
+    vpnExtensionBinding.start(this.context);
     hilog.info(DOMAIN, TAG, 'EntryAbility onCreate. ability=%{public}s reason=%{public}d',
       want.abilityName ?? '', launchParam.launchReason);
   }
@@ -61,6 +66,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void {
+    recordLifecycle(this.context.filesDir, 'ui', 'window-destroyed');
     this.mainWindow = undefined;
     hilog.info(DOMAIN, TAG, 'EntryAbility onWindowStageDestroy');
   }
@@ -70,11 +76,18 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    recordLifecycle(this.context.filesDir, 'ui', 'foreground');
     this.applyEdgeToEdge(this.context.config.colorMode);
     hilog.info(DOMAIN, TAG, 'EntryAbility onForeground');
   }
 
   onBackground(): void {
+    recordLifecycle(this.context.filesDir, 'ui', 'background');
     hilog.info(DOMAIN, TAG, 'EntryAbility onBackground');
+  }
+
+  onDestroy(): void {
+    vpnExtensionBinding.stop();
+    recordLifecycle(this.context.filesDir, 'ui', 'destroyed');
   }
 }

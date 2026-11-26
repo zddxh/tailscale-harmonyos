@@ -1,5 +1,7 @@
 {
   "string": [
+    { "name": "connection_checking", "value": "正在确认连接" },
+    { "name": "description_checking", "value": "正在核实后台连接状态，你仍可手动断开。" },
     { "name": "module_desc", "value": "Tailscale for HarmonyOS NEXT" },
     { "name": "entryability_desc", "value": "Tailscale 鸿蒙主程序" },
     { "name": "entryability_label", "value": "Tailscale 鸿蒙开发版" },

@@ -1,0 +1,157 @@
+{
+  "date": "2026-11-26",
+  "version": "0.3.19-harmony.3",
+  "versionCode": 3190017,
+  "deviceValidationStatus": "PASS within the documented device, duration and scenario limits",
+  "devicePlatform": "HarmonyOS 7 / API 26 / arm64",
+  "baseline": {
+    "version": "0.3.19-harmony.2",
+    "scenario": "Connected VPN, application moved to background, idle observation",
+    "result": "System terminated both UI and VPN processes",
+    "systemReason": "ResourceLeak:Fd Leak",
+    "secondsAfterBackground": 287.028,
+    "vpnFdResourceCountAtKill": 20313
+  },
+  "toolchainFix": {
+    "repository": "https://gitcode.com/openharmony-sig/ohos_golang_go.git",
+    "commit": "302a5306b6fad2f47196360b82561d1db1f954cf",
+    "version": "go1.24.5",
+    "patch": "native/patches/ohos-go-1.24.5-interface-resources.patch",
+    "patchSHA256": "12175a19cf14336534885b49296485c7e8a1fcff06c18b92bdb00901903cb857",
+    "scope": "Close sockets and free successful getifaddrs results in interfaceTable and interfaceAddrTable",
+    "nativeCoreRebuilt": true,
+    "deviceLeakRegression": "PASS within the 757.335-second observation window"
+  },
+  "defensiveChanges": [
+    "Exclusive backend ownership across processes; BUSY preserves explicit disconnect and bounded ownership checks",
+    "Atomic status publication; stale, empty and transient failures are unknown rather than proof of connection or disconnection",
+    "Recovery before reconnecting after explicit extension destruction",
+    "UI-to-VPN binding with fresh TUN evidence, generation guards, failure backoff and bind-only cold-start rejection",
+    "Manual stop suppresses rebinding until a new explicit connection",
+    "Bounded redacted UI and VPN lifecycle journals"
+  ],
+  "bindingProvenance": {
+    "pullRequest": "https://github.com/flypigJ/Tailscale-OHOS/pull/22",
+    "commit": "5defb85198373370ecf83d22e7fc113f4f44ec42",
+    "classification": "Defensive lifecycle improvement; not a substitute for the resource-leak fix"
+  },
+  "checks": {
+    "arktsControllerTests": {
+      "status": "PASS",
+      "passed": 19,
+      "failed": 0,
+      "runtime": "Host with platform stubs"
+    },
+    "goOwnershipAndDNSFocusedRace": "PASS",
+    "goVet": "PASS",
+    "nativeBuild": "PASS",
+    "arktsBuildAndSigning": "PASS",
+    "packagedNativeMatch": "PASS: Go and NAPI bytes match SDK-stripped rebuilt libraries",
+    "toolchainPatchAndBuildReview": "APPROVED",
+    "fullGoSuite": "KNOWN_FAILURE: TestClassifyPeerDevice/laptop classifies ThinkPad as tablet",
+    "replacementInstall": "PASS",
+    "initialConnection": "PASS: Running with TUN established",
+    "extensionBinding": "PASS: vpn-bind-connected event observed",
+    "backgroundSoak": "PASS within the 757.335-second application-background observation window",
+    "fdTrend": "PASS: UI 66 to 64; VPN 51 to 50; no increase across samples at 106, 331, 552 and 757 seconds",
+    "backgroundDataPath": "PASS: full MagicDNS domain HTTP request returned 200 after the observation window",
+    "manualStopRemainsStopped": "PASS after 55.105 seconds: VPN process absent, UI disconnected, no automatic reconnect",
+    "explicitReconnect": "PASS: Running with TUN established; full MagicDNS HTTP request returned 200"
+  },
+  "deviceResults": {
+    "observation": {
+      "startedAt": "2026-11-26T11:16:24+08:00",
+      "endedAt": "2026-11-26T11:29:01+08:00",
+      "elapsedSeconds": 757.335,
+      "sameUIAndVpnProcessesAlive": true,
+      "applicationForegroundEventBeforeEnd": false,
+      "activePeriodicPing": false,
+      "fdSamples": [
+        {
+          "elapsedSeconds": 0,
+          "ui": 66,
+          "vpn": 51
+        },
+        {
+          "elapsedSeconds": 106,
+          "ui": 64,
+          "vpn": 50
+        },
+        {
+          "elapsedSeconds": 331,
+          "ui": 64,
+          "vpn": 50
+        },
+        {
+          "elapsedSeconds": 552,
+          "ui": 64,
+          "vpn": 50
+        },
+        {
+          "elapsedSeconds": 757,
+          "ui": 64,
+          "vpn": 50
+        }
+      ],
+      "beforeAppReopened": {
+        "state": "Running",
+        "tun": true,
+        "dnsQueries": 64,
+        "dnsResponses": 64,
+        "dnsAnswers": 64
+      },
+      "trafficCaveat": "Other phone applications were not isolated; browser favicon requests were observed during the window. This is not a zero-traffic or system-idle test."
+    },
+    "manualStop": {
+      "observationSeconds": 55.105,
+      "manualDisconnectEventPersisted": true,
+      "status": "VPN extension destroyed",
+      "vpnProcessAbsent": true,
+      "uiProcessAlive": true,
+      "uiState": "Disconnected with Connect button",
+      "automaticReconnect": false
+    },
+    "explicitReconnect": {
+      "state": "Running",
+      "tun": true,
+      "httpObservedAt": "2026-11-26T11:33:08+08:00",
+      "addressing": "Full MagicDNS domain",
+      "httpStatus": 200,
+      "rapidBackgroundDuringStartup": true,
+      "httpWorkedBeforeDefensiveBinding": true,
+      "bindingConfirmedAfterAppForegroundAt": "2026-11-26T11:34:31+08:00",
+      "applicationReturnedToBackgroundAfterwards": true
+    },
+    "postObservationHTTP": {
+      "observedAt": "2026-11-26T11:29:23+08:00",
+      "addressing": "Full MagicDNS domain",
+      "serverBinding": "Test host Tailscale address only",
+      "source": "Phone Tailscale address",
+      "httpStatus": 200,
+      "browserText": "Tailscale background connection OK"
+    }
+  },
+  "artifacts": {
+    "signedHAP": {
+      "file": "tailscale-harmonyos-background-fix-signed.hap",
+      "sha256": "57011f128ee962a154804b5d951ff235ba7e814465ee3691ec623ae11bef4e70"
+    },
+    "sourceArchive": {
+      "file": "tailscale-harmonyos-background-fix-source.zip",
+      "sha256Manifest": "BACKGROUND-SHA256SUMS"
+    }
+  },
+  "limits": [
+    "Device evidence covers one device and one 757.335-second application-background observation; hours, days and other devices are not established",
+    "The observation did not isolate other application traffic and is not a zero-network or system-idle test",
+    "Rapid backgrounding before TUN startup completes can defer defensive binding until the UI returns to foreground; the observed reconnect HTTP request succeeded before binding",
+    "The HarmonyOS toolchain interface implementation is not exercised by host Go race tests",
+    "Manual disconnect must remain stopped until the user explicitly reconnects",
+    "No guarantee of survival or automatic reconnection after system kill, force-stop or reboot",
+    "Short-name search, custom tailnet DNS server transport, live network switching and API 23 device compatibility remain unverified",
+    "Development signing is limited to authorized devices"
+  ],
+  "privacy": "Contains only redacted aggregate results and public source identifiers; no raw device logs, process identifiers, account information, IP addresses or credentials",
+  "releaseTag": "v0.3.19-harmony.3",
+  "releaseURL": "https://github.com/zddxh/tailscale-harmonyos/releases/tag/v0.3.19-harmony.3"
+}

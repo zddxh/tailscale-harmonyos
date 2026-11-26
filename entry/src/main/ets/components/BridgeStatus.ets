@@ -1,5 +1,8 @@
 import nativeBridge from 'libtailscale_ohos.so';
 import { PhysicalDNS } from '../services/PhysicalDNS';
+import { inspectVpnStatus, VpnStatusObservation } from '../services/VpnStatusPolicy';
+import { recordLifecycle } from '../services/LocalDiagnostics';
+import { vpnExtensionBinding } from '../services/VpnExtensionBinding';
 import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
@@ -100,6 +103,8 @@ export struct BridgeStatus {
   @State loginHandoffStatus: string = 'Secure Login Pending';
   @State controlProbeStatus: string = 'Control TLS Probe Pending';
   @State vpnStatus: string = 'HarmonyOS VPN Extension Stopped';
+  @State vpnStatusUncertain: boolean = false;
+  @State vpnStopPending: boolean = false;
   @State connectionFailureDetail: string = '';
   @State magicDNSProbeStatus: string = 'MagicDNS Probe Pending';
   @State exitNodes: ExitNodeChoice[] = [];
@@ -154,6 +159,11 @@ export struct BridgeStatus {
   private physicalDNS: PhysicalDNS = new PhysicalDNS();
   private backendStartPending?: Promise<void>;
   private backendStartGeneration: number = -1;
+  private backendOwnedElsewhere: boolean = false;
+  private foreignOwnerObservedAtMs: number = 0;
+  private uiOwnsBackend: boolean = false;
+  private lastOwnershipCheckMs: number = 0;
+  private ignoreVpnHeartbeatBeforeMs: number = 0;
   private peerDataSource: PeerDataSource = new PeerDataSource();
 
   private applyPeers(peers: PeerSummary[]): void {
@@ -171,7 +181,7 @@ export struct BridgeStatus {
     this.loadAppVersion();
     const vpnIsLive: boolean = this.refreshVpnProbeStatus();
     if (!vpnIsLive) {
-      if (!this.isConnecting() && !this.extensionStartupFailed && !this.vpnBackendNeedsRestore) {
+      if (!this.isConnecting() && !this.extensionStartupFailed) {
         this.startBackend();
         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
       }
@@ -185,7 +195,7 @@ export struct BridgeStatus {
     // an application update) while its last heartbeat still looked current.
     this.scheduleLifecycleTask(() => {
       if (!this.isConnecting() && !this.refreshVpnProbeStatus() &&
-        !this.extensionStartupFailed && !this.vpnBackendNeedsRestore) {
+        !this.extensionStartupFailed) {
         this.startBackend();
         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
       }
@@ -269,6 +279,7 @@ export struct BridgeStatus {
 
   private async startBackendWithDNS(): Promise<void> {
     const generation: number = this.lifecycleGeneration;
+    this.lastOwnershipCheckMs = Date.now();
     this.backendReady = false;
     this.devicesLoading = true;
     this.backendStatus = 'Tailscale backend starting | capturing physical DNS';
@@ -283,6 +294,27 @@ export struct BridgeStatus {
       // even if base DNS capture is unavailable. Keep its diagnostic visible.
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       this.backendStatus = nativeBridge.backendStart(`${context.filesDir}/tailscale`, this.deviceModel());
+      if (this.backendStatus === 'BUSY | backend owned by another process') {
+        this.backendOwnedElsewhere = true;
+        this.foreignOwnerObservedAtMs = Date.now();
+        this.uiOwnsBackend = false;
+        this.physicalDNS.stop();
+        this.markVpnStatusUncertain();
+        return;
+      }
+      if (this.backendStatus.startsWith('OK') && !this.backendStatus.includes('tun=true')) {
+        // Only successful acquisition of the native process lock proves that
+        // a previous VPN process no longer owns this persistent backend.
+        this.backendOwnedElsewhere = false;
+        this.foreignOwnerObservedAtMs = 0;
+        this.uiOwnsBackend = true;
+        this.vpnBackendNeedsRestore = false;
+        this.ignoreVpnHeartbeatBeforeMs = Date.now();
+        if (!this.connectInProgress) {
+          this.vpnStatusUncertain = false;
+          this.vpnStatus = 'HarmonyOS VPN Extension Stopped (no active owner)';
+        }
+      }
     } catch (_error) {
       if (generation === this.lifecycleGeneration) {
         this.backendStatus = 'FAILED | backend start | physical DNS or native startup unavailable';
@@ -301,7 +333,7 @@ export struct BridgeStatus {
   }
 
   private async refreshBackendStatus(): Promise<void> {
-    if (this.refreshInFlight) {
+    if (this.refreshInFlight || this.backendOwnedElsewhere) {
       return;
     }
     const generation: number = this.lifecycleGeneration;
@@ -500,7 +532,7 @@ export struct BridgeStatus {
   }
 
   private beginVpnConnection(): void {
-    if (this.connectInProgress || this.isConnecting()) {
+    if (this.connectInProgress || this.isConnecting() || this.vpnStatusUncertain || this.vpnStopPending) {
       return;
     }
     this.clearConnectionCompletionTimer();
@@ -509,6 +541,7 @@ export struct BridgeStatus {
     this.vpnRequestStartedAtMs = 0;
     this.vpnRequestAcceptedAtMs = 0;
     this.connectionStartedAtMs = Date.now();
+    vpnExtensionBinding.allowNewConnection();
     this.setConnectInProgress(true);
     // Let the button render its loading state before the native/VPN calls.
     this.scheduleLifecycleTask(() => this.startVpnProbe(), 300);
@@ -528,8 +561,14 @@ export struct BridgeStatus {
         this.extensionStartupFailed = false;
       }
       if (restoreBackend) {
-        this.vpnBackendNeedsRestore = false;
         await this.startBackend();
+      }
+      if (this.backendOwnedElsewhere) {
+        // The previous extension may still be releasing its core. Keep the
+        // unknown session stoppable and let bounded ownership polling resolve
+        // it; a local config/snapshot cannot describe the other process.
+        this.setConnectInProgress(false);
+        return;
       }
       let backendConfig: string = await nativeBridge.backendVpnConfigAsync();
       for (let attempt: number = 0; restoreBackend && backendConfig.startsWith('FAILED') &&
@@ -571,6 +610,7 @@ export struct BridgeStatus {
         this.scheduleLifecycleTask(() => this.refreshBackendStatus(), 1500);
         return;
       }
+      this.uiOwnsBackend = false;
       this.vpnStatus = 'Requesting HarmonyOS VPN authorization';
       this.vpnRequestStartedAtMs = Date.now();
       await vpnExtension.startVpnExtensionAbility(this.vpnWant());
@@ -594,6 +634,7 @@ export struct BridgeStatus {
   }
 
   private failVpnConnection(status: string, detail: string): void {
+    this.vpnStatusUncertain = false;
     this.vpnStatus = status;
     this.connectionFailureDetail = detail;
     this.vpnFailureAtMs = Date.now();
@@ -620,10 +661,21 @@ export struct BridgeStatus {
   }
 
   private stopVpnProbe(): void {
+    if (this.vpnStopPending) {
+      return;
+    }
+    this.vpnStopPending = true;
+    vpnExtensionBinding.beforeManualStop();
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    recordLifecycle(context.filesDir, 'ui', 'manual-disconnect');
     this.clearConnectionCompletionTimer();
     this.setConnectInProgress(false);
     vpnExtension.stopVpnExtensionAbility(this.vpnWant())
       .then(() => {
+        this.vpnStatusUncertain = false;
+        this.backendOwnedElsewhere = false;
+        this.uiOwnsBackend = false;
+        this.ignoreVpnHeartbeatBeforeMs = Date.now();
         this.vpnStatus = 'HarmonyOS VPN Extension stopped';
         this.stopConnectionPolling();
         this.startBackend();
@@ -631,7 +683,8 @@ export struct BridgeStatus {
       })
       .catch((error: BusinessError) => {
         this.vpnStatus = `FAILED | VPN stop | code=${error.code}`;
-      });
+      })
+      .finally(() => { this.vpnStopPending = false; });
   }
 
   private confirmLogout(): void {
@@ -653,6 +706,7 @@ export struct BridgeStatus {
   }
 
   private async logout(): Promise<void> {
+    vpnExtensionBinding.beforeManualStop();
     try {
       this.logoutStatus = await nativeBridge.backendLogoutAsync();
       if (!this.logoutStatus.startsWith('FAILED')) {
@@ -670,24 +724,27 @@ export struct BridgeStatus {
     }
   }
 
+  private markVpnStatusUncertain(): void {
+    this.vpnStatusUncertain = true;
+    this.vpnStatus = 'UNKNOWN | VPN session | checking ownership and activity';
+    this.backendReady = true;
+    this.devicesLoading = false;
+    this.clearConnectionCompletionTimer();
+  }
+
   private refreshVpnProbeStatus(): boolean {
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const statusPath: string = `${context.filesDir}/vpn-probe-status.txt`;
-      if (!fileIo.accessSync(statusPath)) {
-        this.expireMissingVpnHeartbeat(0);
-        if (!this.connectInProgress && this.connectionFailureDetail.length === 0) {
-          this.vpnStatus = 'HarmonyOS VPN Extension Stopped';
-        }
+      const persistedStatus: string = fileIo.accessSync(statusPath) ? fileIo.readTextSync(statusPath) : '';
+      const observation: VpnStatusObservation = inspectVpnStatus(persistedStatus, Date.now());
+      const heartbeatMs: number = observation.heartbeatMs;
+      const visibleStatus: string = observation.status;
+      if (heartbeatMs > 0 && heartbeatMs <= this.ignoreVpnHeartbeatBeforeMs && !this.connectInProgress) {
+        // This process acquired the exclusive core lock after that record was
+        // written. An old heartbeat must not resurrect the ended VPN session.
         return false;
       }
-      const persistedStatus: string = fileIo.readTextSync(statusPath);
-      const heartbeatMatch: RegExpMatchArray | null = persistedStatus.match(/heartbeatMs=(\d+)/);
-      const heartbeatMs: number = heartbeatMatch === null ? 0 : Number(heartbeatMatch[1]);
-      const heartbeatAgeMs: number = Date.now() - heartbeatMs;
-      const heartbeatIsFresh: boolean = heartbeatMs > 0 && heartbeatAgeMs >= 0 && heartbeatAgeMs <= 5000;
-      const visibleStatus: string = persistedStatus.replace(/\s*\|\s*heartbeatMs=\d+/, '');
-      const extensionIsLive: boolean = heartbeatIsFresh && !visibleStatus.includes('destroyed');
       // A previous session's file must not complete a new attempt or erase a
       // useful start error before the new extension has written its own status.
       if ((this.connectInProgress && heartbeatMs < this.connectionStartedAtMs) ||
@@ -695,43 +752,50 @@ export struct BridgeStatus {
         this.expireMissingVpnHeartbeat(heartbeatMs);
         return false;
       }
-      if (visibleStatus.includes('destroyed') && heartbeatMs >= this.connectionStartedAtMs &&
-        !this.connectInProgress && this.extensionStartupFailed) {
-        this.extensionStartupFailed = false;
-        this.vpnBackendNeedsRestore = true;
+      if (this.backendOwnedElsewhere && heartbeatMs <= this.foreignOwnerObservedAtMs &&
+        (observation.kind === 'stopped' || observation.kind === 'failed')) {
+        // A historical exit record cannot override the newer native proof
+        // that another process still owns the core. Keep its stop action and
+        // bounded ownership checks until a newer status or successful acquire.
+        this.markVpnStatusUncertain();
         return false;
       }
-      if (visibleStatus.includes('destroyed') && this.connectInProgress &&
-        this.vpnRequestAcceptedAtMs > 0 && heartbeatMs >= this.vpnRequestStartedAtMs) {
-        // onDestroy is already terminal; retry must restore the UI core rather
-        // than request another stop against an extension that has exited.
-        this.extensionStartupFailed = false;
-        this.vpnBackendNeedsRestore = true;
-        this.failVpnConnection('FAILED | VPN connection cancelled | extension destroyed',
-          'VPN 连接已结束，请重试。');
-        return false;
-      }
-      // Terminal failures are written once, so they remain meaningful even
-      // when the UI resumes after the heartbeat freshness window has elapsed.
-      if (visibleStatus.startsWith('FAILED')) {
-        if (this.connectInProgress || heartbeatIsFresh) {
-          this.extensionStartupFailed = true;
+      if (observation.kind === 'stopped') {
+        this.vpnStatusUncertain = false;
+        this.backendOwnedElsewhere = false;
+        this.vpnStatus = visibleStatus;
+        if (!this.uiOwnsBackend) {
+          this.vpnBackendNeedsRestore = true;
         }
+        if (!this.connectInProgress && this.extensionStartupFailed) {
+          this.extensionStartupFailed = false;
+        } else if (this.connectInProgress && this.vpnRequestAcceptedAtMs > 0 &&
+          heartbeatMs >= this.vpnRequestStartedAtMs) {
+          this.extensionStartupFailed = false;
+          this.failVpnConnection('FAILED | VPN connection cancelled | extension destroyed',
+            'VPN 连接已结束，请重试。');
+        }
+        return false;
+      }
+      if (observation.kind === 'failed') {
+        this.extensionStartupFailed = true;
         this.failVpnConnection(visibleStatus, 'VPN 连接失败，请重试。');
         return false;
       }
       if (this.expireMissingVpnHeartbeat(heartbeatMs)) {
         return false;
       }
-      if (!extensionIsLive) {
-        this.clearConnectionCompletionTimer();
-        if (!this.connectInProgress && this.connectionFailureDetail.length === 0) {
-          this.vpnStatus = visibleStatus.startsWith('FAILED') ? visibleStatus :
-            'HarmonyOS VPN Extension Stopped (previous session ended)';
+      if (observation.kind === 'unknown') {
+        // A frozen timer, empty read, or transient snapshot failure cannot
+        // prove the tunnel stopped. Native ownership resolves stale boot files.
+        if (!this.uiOwnsBackend && this.connectionFailureDetail.length === 0) {
+          this.markVpnStatusUncertain();
         }
         return false;
       }
-      if (visibleStatus.includes('state=Running') && this.connectInProgress) {
+      this.vpnStatusUncertain = false;
+      this.uiOwnsBackend = false;
+      if (observation.kind === 'running' && this.connectInProgress) {
         const remainingMs: number = MIN_CONNECTION_LOADING_MS -
           (Date.now() - this.connectionStartedAtMs);
         if (remainingMs > 0) {
@@ -740,25 +804,25 @@ export struct BridgeStatus {
               this.commitConnectedStatus();
             }, remainingMs);
           }
-          return extensionIsLive;
+          return true;
         }
       }
       this.vpnStatus = visibleStatus;
-      if (visibleStatus.includes('state=Running')) {
+      if (observation.kind === 'running') {
         this.connectionFailureDetail = '';
         this.vpnFailureAtMs = 0;
         this.extensionStartupFailed = false;
         this.vpnBackendNeedsRestore = false;
         this.vpnRequestAcceptedAtMs = 0;
-      }
-      if (visibleStatus.includes('state=Running') || visibleStatus.startsWith('FAILED')) {
         this.clearConnectionCompletionTimer();
         this.setConnectInProgress(false);
       }
-      return extensionIsLive;
-    } catch (error) {
-      const businessError = error as BusinessError;
-      this.vpnStatus = `FAILED | VPN status file | code=${businessError.code}`;
+      return true;
+    } catch (_error) {
+      if (!this.uiOwnsBackend && this.connectionFailureDetail.length === 0) {
+        this.markVpnStatusUncertain();
+      }
+      this.expireMissingVpnHeartbeat(0);
       return false;
     }
   }
@@ -824,7 +888,17 @@ export struct BridgeStatus {
         return;
       }
       const vpnIsLive: boolean = this.refreshVpnProbeStatus();
-      const refresh: Promise<void> = vpnIsLive ? Promise.resolve() : this.refreshBackendStatus();
+      let refresh: Promise<void> = Promise.resolve();
+      if (!vpnIsLive && !this.vpnStopPending) {
+        if (this.vpnStatusUncertain && !this.connectInProgress &&
+          Date.now() - this.lastOwnershipCheckMs >= 10000) {
+          // This attempts only exclusive UI-core ownership; it never restarts
+          // the system VPN. A BUSY result leaves the other process untouched.
+          refresh = this.startBackend();
+        } else if (!this.backendOwnedElsewhere && !this.vpnStatusUncertain) {
+          refresh = this.refreshBackendStatus();
+        }
+      }
       refresh.finally(() => {
         if (generation === this.lifecycleGeneration) {
           this.scheduleHealthPoll(generation);
@@ -841,7 +915,11 @@ export struct BridgeStatus {
   }
 
   private isConnected(): boolean {
-    return this.vpnStatus.includes('state=Running');
+    return !this.vpnStatusUncertain && this.vpnStatus.includes('state=Running');
+  }
+
+  private hasActiveVpnSession(): boolean {
+    return this.isConnected() || this.vpnStatusUncertain;
   }
 
   private isConnecting(): boolean {
@@ -990,6 +1068,9 @@ export struct BridgeStatus {
   }
 
   private connectionTitle(): ResourceStr {
+    if (this.vpnStatusUncertain) {
+      return $r('app.string.connection_checking');
+    }
     if (this.isBackendLoading()) {
       return $r('app.string.connection_starting');
     }
@@ -1009,6 +1090,9 @@ export struct BridgeStatus {
   }
 
   private connectionDescription(): ResourceStr {
+    if (this.vpnStatusUncertain) {
+      return $r('app.string.description_checking');
+    }
     if (this.connectionFailureDetail.length > 0) {
       return this.connectionFailureDetail;
     }
@@ -1047,7 +1131,7 @@ export struct BridgeStatus {
     if (this.isConnected()) {
       return $r('app.color.status_success');
     }
-    if (this.isConnecting()) {
+    if (this.isConnecting() || this.vpnStatusUncertain) {
       return $r('app.color.status_warning');
     }
     if (this.hasConnectionProblem()) {
@@ -1489,9 +1573,9 @@ export struct BridgeStatus {
       }
       .width('100%')
 
-      if (this.isConnected()) {
-        this.StandardActionButton($r('app.string.action_disconnect'), 'vpn-stop', false, true,
-          () => this.stopVpnProbe())
+      if (this.hasActiveVpnSession()) {
+        this.StandardActionButton($r('app.string.action_disconnect'), 'vpn-stop', false, !this.vpnStopPending,
+          () => this.stopVpnProbe(), this.vpnStopPending)
       } else if (this.isBackendLoading()) {
         this.StandardActionButton($r('app.string.action_starting'), 'backend-starting', true,
           false, () => {}, true)
@@ -1524,8 +1608,8 @@ export struct BridgeStatus {
         .alignItems(HorizontalAlign.Start)
         Toggle({ type: ToggleType.Switch, isOn: this.networkSettings.routeAll })
           .id('route-all-toggle')
-          .enabled(!this.isConnected() && this.isAuthenticated())
-          .opacity(!this.isConnected() && this.isAuthenticated() ? 1 : 0.4)
+          .enabled(!this.hasActiveVpnSession() && this.isAuthenticated())
+          .opacity(!this.hasActiveVpnSession() && this.isAuthenticated() ? 1 : 0.4)
           .onChange((enabled: boolean) => this.setNetworkSetting('routeAll', enabled))
       }
       .width('100%')
@@ -1547,8 +1631,8 @@ export struct BridgeStatus {
         .alignItems(HorizontalAlign.Start)
         Toggle({ type: ToggleType.Switch, isOn: this.networkSettings.corpDNS })
           .id('tailscale-dns-toggle')
-          .enabled(!this.isConnected() && this.isAuthenticated())
-          .opacity(!this.isConnected() && this.isAuthenticated() ? 1 : 0.4)
+          .enabled(!this.hasActiveVpnSession() && this.isAuthenticated())
+          .opacity(!this.hasActiveVpnSession() && this.isAuthenticated() ? 1 : 0.4)
           .onChange((enabled: boolean) => this.setNetworkSetting('corpDNS', enabled))
       }
       .width('100%')
@@ -1571,8 +1655,8 @@ export struct BridgeStatus {
         .alignItems(HorizontalAlign.Start)
         Toggle({ type: ToggleType.Switch, isOn: this.networkSettings.exitNodeAllowLANAccess })
           .id('exit-node-lan-toggle')
-          .enabled(!this.isConnected() && this.isAuthenticated())
-          .opacity(!this.isConnected() && this.isAuthenticated() ? 1 : 0.4)
+          .enabled(!this.hasActiveVpnSession() && this.isAuthenticated())
+          .opacity(!this.hasActiveVpnSession() && this.isAuthenticated() ? 1 : 0.4)
           .onChange((enabled: boolean) =>
             this.setNetworkSetting('exitNodeAllowLANAccess', enabled))
       }
@@ -1681,11 +1765,11 @@ export struct BridgeStatus {
       } else {
         this.ExitNodeChoiceButton($r('app.string.exit_node_none'), 'exit-node-none',
           !this.exitNodes.some((choice: ExitNodeChoice) => choice.selected),
-          !this.isConnected() && !this.isConnecting() && !this.connectInProgress,
+          !this.hasActiveVpnSession() && !this.isConnecting() && !this.connectInProgress,
           () => this.setExitNode(''))
         ForEach(this.exitNodes, (choice: ExitNodeChoice) => {
           this.ExitNodeChoiceButton(choice.name, 'exit-node-' + choice.id, choice.selected,
-            choice.online && !this.isConnected() && !this.isConnecting() && !this.connectInProgress,
+            choice.online && !this.hasActiveVpnSession() && !this.isConnecting() && !this.connectInProgress,
             () => this.setExitNode(choice.id))
         }, (choice: ExitNodeChoice) => choice.id)
       }
@@ -2026,7 +2110,7 @@ export struct BridgeStatus {
         this.AccountDetailRow($r('app.string.account_device'),
           this.accountSummary.deviceName, 'account-device')
 
-        if (!this.isConnected()) {
+        if (!this.hasActiveVpnSession()) {
           Text($r('app.string.logout_description'))
             .fontSize(12)
             .fontColor($r('sys.color.font_secondary'))

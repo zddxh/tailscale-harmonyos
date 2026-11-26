@@ -1,0 +1,55 @@
+diff --git a/src/net/cgo_unix_cgo.go b/src/net/cgo_unix_cgo.go
+index 3c46fc5..0fb1897 100644
+--- a/src/net/cgo_unix_cgo.go
++++ b/src/net/cgo_unix_cgo.go
+@@ -92,6 +92,10 @@ func _C_getifaddrs(res **_C_struct_ifaddrs) (int, error) {
+ 	return int(x), err
+ }
+ 
++func _C_freeifaddrs(ifa *_C_struct_ifaddrs) {
++	C.freeifaddrs(ifa)
++}
++
+ func _C_ifa_next(ifa *_C_struct_ifaddrs) **_C_struct_ifaddrs  { return &ifa.ifa_next }
+ func _C_ifa_addr(ifa *_C_struct_ifaddrs) **_C_struct_sockaddr { return &ifa.ifa_addr }
+ func _C_ifa_mask(ifa *_C_struct_ifaddrs) **_C_struct_sockaddr { return &ifa.ifa_netmask }
+diff --git a/src/net/interface_table_openharmony.go b/src/net/interface_table_openharmony.go
+index 161688f..14a635b 100644
+--- a/src/net/interface_table_openharmony.go
++++ b/src/net/interface_table_openharmony.go
+@@ -22,6 +22,9 @@ func interfaceTable(ifindex int) ([]Interface, error) {
+ 	// get all internet address
+ 	var res *_C_struct_ifaddrs
+ 	gerrno, err := _C_getifaddrs(&res)
++	if gerrno == 0 {
++		defer _C_freeifaddrs(res)
++	}
+ 	if gerrno != 0 || err != nil {
+ 		return nil, os.NewSyscallError("_C_getifaddrs", errors.Join(err, errors.New(_C_gai_strerror(_C_int(gerrno)))))
+ 	}
+@@ -31,6 +34,7 @@ func interfaceTable(ifindex int) ([]Interface, error) {
+ 	if err != nil {
+ 		return nil, os.NewSyscallError("Socket", err)
+ 	}
++	defer syscall.Close(s)
+ 
+ 	var ifts []Interface
+ 	processed := make(map[int]int)
+@@ -89,6 +93,9 @@ func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
+ 	// get all internet address
+ 	var res *_C_struct_ifaddrs
+ 	gerrno, err := _C_getifaddrs(&res)
++	if gerrno == 0 {
++		defer _C_freeifaddrs(res)
++	}
+ 	if gerrno != 0 || err != nil {
+ 		return nil, os.NewSyscallError("_C_getifaddrs", errors.Join(err, errors.New(_C_gai_strerror(_C_int(gerrno)))))
+ 	}
+@@ -98,6 +105,7 @@ func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
+ 	if err != nil {
+ 		return nil, os.NewSyscallError("Socket", err)
+ 	}
++	defer syscall.Close(s)
+ 
+ 	var addrs []Addr
+ 	for r := res; r != nil; r = *_C_ifa_next(r) {

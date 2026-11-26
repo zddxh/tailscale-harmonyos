@@ -2,9 +2,10 @@ import { Want } from '@kit.AbilityKit';
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { fileIo } from '@kit.CoreFileKit';
 import nativeBridge from 'libtailscale_ohos.so';
 import { PhysicalDNS } from '../services/PhysicalDNS';
+import { recordLifecycle, writeAtomicText } from '../services/LocalDiagnostics';
+import { rpc } from '@kit.IPCKit';
 
 const DOMAIN = 0x0000;
 const TAG = 'TailscaleVpn';
@@ -15,6 +16,8 @@ interface BackendHealthSnapshot {
 }
 
 export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
+  private bindStub?: rpc.RemoteObject;
+  private rejectedBindOnlyStart: boolean = false;
   private vpnConnection?: vpnExtension.VpnConnection;
   private tunFd: number = -1;
   private statusTimer: number = -1;
@@ -25,6 +28,17 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
   private physicalDNSStatus: string = 'Physical DNS pending';
 
   onCreate(want: Want): void {
+    if (want.parameters?.tailscaleBindOnly === true) {
+      // Binding may race a service exit. A bind-only cold start must not
+      // recreate a tunnel that the user or system already stopped.
+      this.rejectedBindOnlyStart = true;
+      this.destroyed = true;
+      vpnExtension.stopVpnExtensionAbility(want).catch((error: BusinessError): void => {
+        recordLifecycle(this.context.filesDir, 'vpn', 'bind-only-stop-failed', -1, 0, 0, error.code ?? -1);
+      });
+      return;
+    }
+    recordLifecycle(this.context.filesDir, 'vpn', 'created');
     this.writeStatus('VPN extension lifecycle entered');
     hilog.info(DOMAIN, TAG, 'VPN extension created. ability=%{public}s', want.abilityName ?? '');
     try {
@@ -43,6 +57,16 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
     }
   }
 
+  onConnect(_want: Want): rpc.RemoteObject {
+    if (this.bindStub === undefined) {
+      this.bindStub = new rpc.RemoteObject('com.example.tailscaleharmony.vpn.bind');
+    }
+    if (!this.destroyed) {
+      recordLifecycle(this.context.filesDir, 'vpn', 'bound');
+    }
+    return this.bindStub;
+  }
+
   private async createProbeTun(): Promise<void> {
     const connection = this.vpnConnection;
     if (connection === undefined) {
@@ -55,6 +79,15 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
     // state directory here and wait until the assigned addresses are ready.
     const backendConfigText: string = await this.restoreBackendVpnConfig();
     if (this.destroyed) {
+      return;
+    }
+    if (backendConfigText.startsWith('BUSY')) {
+      // An existing owner may still have a working tunnel. Do not destroy it
+      // or run cleanup against it merely because this instance cannot start.
+      this.stopStatusUpdates();
+      this.physicalDNS.stop();
+      this.writeStatus('UNKNOWN | VPN backend ownership busy');
+      recordLifecycle(this.context.filesDir, 'vpn', 'ownership-busy');
       return;
     }
     if (backendConfigText.startsWith('FAILED')) {
@@ -192,7 +225,7 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
     }
     const stateDir: string = `${this.context.filesDir}/tailscale`;
     const startStatus: string = nativeBridge.backendStart(stateDir, this.deviceModel());
-    if (startStatus.startsWith('FAILED')) {
+    if (startStatus.startsWith('FAILED') || startStatus.startsWith('BUSY')) {
       return startStatus;
     }
     this.writeStatus('VPN backend starting | restoring authenticated session');
@@ -302,6 +335,7 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
       return;
     }
     this.stopStatusUpdates();
+    recordLifecycle(this.context.filesDir, 'vpn', 'startup-failed');
     this.physicalDNS.stop();
     this.writeStatus(status);
     this.cleanupBackend();
@@ -339,10 +373,13 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
       nativeBridge.backendSnapshot()
         .then((snapshotText: string) => {
           const snapshot: BackendHealthSnapshot = JSON.parse(snapshotText) as BackendHealthSnapshot;
-          this.writeStatus(snapshot.status);
+          // A diagnostic snapshot is not a teardown signal. In particular,
+          // timeouts after background scheduling must not report a stopped VPN.
+          this.writeStatus(snapshot.status.startsWith('FAILED') ?
+            'UNKNOWN | VPN backend | status unavailable' : snapshot.status);
         })
         .catch(() => {
-          this.writeStatus('FAILED | VPN backend | status unavailable');
+          this.writeStatus('UNKNOWN | VPN backend | status unavailable');
         })
         .finally(() => {
           this.statusUpdateInFlight = false;
@@ -367,25 +404,15 @@ export default class TailscaleVpnExtensionAbility extends VpnExtensionAbility {
   }
 
   private writeTextFile(path: string, content: string): void {
-    let file: fileIo.File | undefined = undefined;
-    try {
-      file = fileIo.openSync(path,
-        fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
-      fileIo.writeSync(file.fd, content);
-    } catch (_error) {
-      // Status persistence is best-effort and must never stop VPN startup.
-    } finally {
-      if (file !== undefined) {
-        try {
-          fileIo.closeSync(file);
-        } catch (_error) {
-          // The descriptor may already be closed after a platform write failure.
-        }
-      }
-    }
+    writeAtomicText(path, content);
   }
 
   onDestroy(): void {
+    this.bindStub = undefined;
+    if (this.rejectedBindOnlyStart) {
+      return;
+    }
+    recordLifecycle(this.context.filesDir, 'vpn', 'destroyed');
     this.stopStatusUpdates();
     this.physicalDNS.stop();
     this.writeStatus('VPN extension destroyed');

@@ -17,7 +17,12 @@
   "goToolchain": {
     "repository": "https://gitcode.com/openharmony-sig/ohos_golang_go.git",
     "commit": "302a5306b6fad2f47196360b82561d1db1f954cf",
-    "version": "go1.24.5"
+    "version": "go1.24.5",
+    "patch": "patches/ohos-go-1.24.5-interface-resources.patch",
+    "patchSHA256": "12175a19cf14336534885b49296485c7e8a1fcff06c18b92bdb00901903cb857",
+    "manifest": "ohos-go-1.24.5-interface-resources.sha256",
+    "manifestSHA256": "b053903b9074c23403c0ca845f292c9dd323f2b1b78c884fbc7bfea04f7175c6",
+    "patchPurpose": "Close interface-query sockets and free getifaddrs allocations on all successful acquisition paths."
   },
   "target": "openharmony/arm64",
   "sdk": "DevEco Studio 26.0.1.290, HarmonyOS API 26 Beta1",

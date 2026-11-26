@@ -15,6 +15,15 @@ test -f "$project_root/third_party/tailscale/go.mod"
 test "$(git -C "$go_root" rev-parse HEAD)" = 302a5306b6fad2f47196360b82561d1db1f954cf
 test "$(head -n 1 "$go_root/VERSION")" = go1.24.5
 mkdir -p "$build_dir" "$dist_dir" "$lib_dir" "$project_root/build-logs"
+if ! (
+  cd "$go_root"
+  shasum -a 256 -c "$project_root/native/ohos-go-1.24.5-interface-resources.sha256" \
+    > "$project_root/build-logs/toolchain-checksums.log" 2>&1
+); then
+  echo "The pinned OpenHarmony Go toolchain must include the interface-resource cleanup patch." >&2
+  echo "Apply native/patches/ohos-go-1.24.5-interface-resources.patch as described in BUILD_LOCAL.md." >&2
+  exit 1
+fi
 (
   cd "$project_root/third_party/tailscale"
   shasum -a 256 -c "$project_root/native/tailscale-v1.86.5-patched.sha256" > "$project_root/build-logs/vendor-checksums.log"

@@ -1,5 +1,7 @@
 {
   "string": [
+    { "name": "connection_checking", "value": "Checking connection" },
+    { "name": "description_checking", "value": "Checking the background connection. You can still disconnect manually." },
     {
       "name": "module_desc",
       "value": "Tailscale for HarmonyOS NEXT"
